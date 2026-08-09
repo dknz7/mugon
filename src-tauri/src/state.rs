@@ -294,7 +294,11 @@ impl Core {
     /// old one keeps the state the machine set. Without the reassertion, a
     /// device change in Push to Talk leaves the *old* device muted and the
     /// *new* one live — the user believes they are muted at rest and is hot.
-    pub fn select_device(&mut self, id: Option<String>) {
+    ///
+    /// Returns the mute state it left behind, for the same reason
+    /// [`Self::apply_mode`] does: `reapply_resting_state` can flip mute, and the
+    /// tray icon has to follow.
+    pub fn select_device(&mut self, id: Option<String>) -> bool {
         let result = self.machine.mic_mut().select(id.as_deref());
         if result.is_ok() {
             self.machine.reapply_resting_state();
@@ -305,6 +309,13 @@ impl Core {
         // on the next launch rather than being silently forgotten.
         self.config.device_id = id;
         self.persist();
+        // A bare read, deliberately **not** [`Self::refresh_mic_health`]. That
+        // would fold this probe into `last_error` and, on a failed selection
+        // where the endpoint still answers, clear the very "that device isn't
+        // there" message `record_outcome` just stored — see
+        // `a_failed_selection_still_persists_the_users_choice_and_records_why`.
+        // The select's own reason is the more useful one, so it stands.
+        self.machine.mic().is_muted().unwrap_or(false)
     }
 
     /// Persists config. Failures are logged, never fatal — a read-only
@@ -558,8 +569,9 @@ mod tests {
         // Simulate the newly selected endpoint arriving live.
         core.machine.mic_mut().set_muted(false).unwrap();
 
-        core.select_device(Some("device-2".into()));
+        let muted = core.select_device(Some("device-2".into()));
 
+        assert!(muted, "the caller needs the new mute state to pick a tray icon");
         assert!(
             core.machine.mic().is_muted().unwrap(),
             "a device change in PTT must not leave the new device hot"
@@ -573,8 +585,9 @@ mod tests {
         let (mut core, _dir) = fake_core(Mode::MuteToggle);
         core.machine.mic_mut().set_muted(true).unwrap();
 
-        core.select_device(None);
+        let muted = core.select_device(None);
 
+        assert!(!muted, "the reported state must match the device, not the old icon");
         assert!(!core.machine.mic().is_muted().unwrap(), "Mute Toggle rests unmuted");
         assert_eq!(core.config.device_id, None);
     }
@@ -586,9 +599,12 @@ mod tests {
         let (mut core, dir) = fake_core(Mode::MuteToggle);
         core.machine = ModeMachine::new(Mic::Unavailable, Mode::MuteToggle);
 
-        core.select_device(Some("unplugged-device".into()));
+        let _muted = core.select_device(Some("unplugged-device".into()));
 
         assert_eq!(core.config.device_id.as_deref(), Some("unplugged-device"));
+        // The *select's* reason, not the follow-up mute probe's. `select_device`
+        // reads mute for the tray icon without recording it precisely so this
+        // stays the more specific message.
         assert_eq!(core.last_error.as_deref(), Some("no capture device available"));
         assert_eq!(
             Config::load(dir.path()).device_id.as_deref(),

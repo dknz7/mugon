@@ -42,7 +42,13 @@ pub fn set_device(app: AppHandle, core: State<Shared>, id: Option<String>) {
     // The select, the resting-state reassertion and the persist are one unit
     // in `Core::select_device` so they can be tested together — getting the
     // reassertion wrong leaves a push-to-talk user hot. See its docs.
-    lock_or_recover(&core).select_device(id);
+    //
+    // Guard is a temporary of this statement, so it is dead before both calls
+    // below. The icon refresh matters because the reassertion *changes* mute:
+    // picking a new device in Push to Talk mutes it, and a tray still showing
+    // the live glyph would be telling the user the opposite of the truth.
+    let muted = lock_or_recover(&core).select_device(id);
+    crate::tray::update_icon(&app, muted);
     emit_state(&app);
 }
 
