@@ -86,7 +86,7 @@ pub fn run() {
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_autostart::init(
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
-            Some(vec!["--minimized"]),
+            Some(vec![autostart::LAUNCH_ARG]),
         ))
         .manage::<Shared>(Mutex::new(Core {
             machine,
@@ -129,12 +129,12 @@ pub fn run() {
             // (`"windows": []`), so nothing exists yet — `tray::show_window`
             // is the single window-creation path (the same one every later
             // "show settings" click uses) and starts metering itself once the
-            // window it just built exists. Task 12: when launched with
-            // `--minimized` (the autostart argument registered below), skip
-            // this entirely — no window is opened and Windows'
-            // microphone-in-use indicator stays dark, which is the whole
-            // point.
-            if !std::env::args().any(|arg| arg == "--minimized") {
+            // window it just built exists. Task 12: `autostart::launched_minimized`
+            // reports whether this process carries the autostart argument
+            // registered above; when it does, skip this entirely — no window
+            // is opened and Windows' microphone-in-use indicator stays dark,
+            // which is the whole point.
+            if !autostart::launched_minimized() {
                 tray::show_window(&handle);
             }
 

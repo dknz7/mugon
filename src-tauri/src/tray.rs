@@ -198,6 +198,10 @@ pub fn show_window(app: &AppHandle) {
         .inner_size(460.0, 700.0)
         .resizable(false)
         .maximizable(false)
+        // Explicit rather than relying on Tauri's default (which is `true`
+        // and does match this) — Task 12's fix round 1 asked for this to
+        // stop being a question anyone has to go verify against the source.
+        .decorations(true)
         .build();
 
     match built {
