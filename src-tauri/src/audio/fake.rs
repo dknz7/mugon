@@ -50,6 +50,36 @@ impl MicControl for FakeMic {
     fn peak(&self) -> Result<f32, AudioError> { Ok(self.peak) }
 }
 
+/// Lets the audio worker thread be exercised end to end without audio hardware.
+///
+/// Delegates to the `MicControl` impl above through UFCS. `MicBackend` is
+/// deliberately *not* imported into this module: `FakeMic` implements two traits
+/// with identical method names, and keeping only `MicControl` in scope means
+/// plain `mic.set_muted(..)` calls in this file stay unambiguous.
+impl super::MicBackend for FakeMic {
+    fn list_devices(&self) -> Result<Vec<DeviceInfo>, AudioError> {
+        <Self as MicControl>::list_devices(self)
+    }
+    fn select(&mut self, id: Option<&str>) -> Result<(), AudioError> {
+        <Self as MicControl>::select(self, id)
+    }
+    fn is_muted(&self) -> Result<bool, AudioError> {
+        <Self as MicControl>::is_muted(self)
+    }
+    fn set_muted(&mut self, muted: bool) -> Result<(), AudioError> {
+        <Self as MicControl>::set_muted(self, muted)
+    }
+    fn volume(&self) -> Result<f32, AudioError> {
+        <Self as MicControl>::volume(self)
+    }
+    fn set_volume(&mut self, level: f32) -> Result<(), AudioError> {
+        <Self as MicControl>::set_volume(self, level)
+    }
+    fn peak(&self) -> Result<f32, AudioError> {
+        <Self as MicControl>::peak(self)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -228,6 +228,35 @@ impl Endpoint {
     }
 }
 
+/// Pure delegation to the inherent methods above. `MicBackend` is the non-`Send`
+/// trait the confined worker thread drives; see [`super::MicBackend`].
+///
+/// Each body names the inherent method by path rather than calling through
+/// `self`, so this impl can never accidentally recurse into itself.
+impl super::MicBackend for Endpoint {
+    fn list_devices(&self) -> Result<Vec<DeviceInfo>, AudioError> {
+        Endpoint::list_devices(self)
+    }
+    fn select(&mut self, id: Option<&str>) -> Result<(), AudioError> {
+        Endpoint::select(self, id)
+    }
+    fn is_muted(&self) -> Result<bool, AudioError> {
+        Endpoint::is_muted(self)
+    }
+    fn set_muted(&mut self, muted: bool) -> Result<(), AudioError> {
+        Endpoint::set_muted(self, muted)
+    }
+    fn volume(&self) -> Result<f32, AudioError> {
+        Endpoint::volume(self)
+    }
+    fn set_volume(&mut self, level: f32) -> Result<(), AudioError> {
+        Endpoint::set_volume(self, level)
+    }
+    fn peak(&self) -> Result<f32, AudioError> {
+        Endpoint::peak(self)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

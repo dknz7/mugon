@@ -1,6 +1,7 @@
 pub mod endpoint;
 #[cfg(test)]
 pub mod fake;
+pub mod thread;
 
 use serde::Serialize;
 
@@ -27,6 +28,26 @@ pub struct DeviceInfo {
 /// The only interface `modes.rs` is allowed to depend on, so the mode state
 /// machine can be tested against `fake::FakeMic` without Core Audio (§3).
 pub trait MicControl: Send {
+    fn list_devices(&self) -> Result<Vec<DeviceInfo>, AudioError>;
+    fn select(&mut self, id: Option<&str>) -> Result<(), AudioError>;
+    fn is_muted(&self) -> Result<bool, AudioError>;
+    fn set_muted(&mut self, muted: bool) -> Result<(), AudioError>;
+    fn volume(&self) -> Result<f32, AudioError>;
+    fn set_volume(&mut self, level: f32) -> Result<(), AudioError>;
+    fn peak(&self) -> Result<f32, AudioError>;
+}
+
+/// What the audio worker thread drives. Deliberately **not** `Send`:
+/// implementors may be apartment-bound COM objects that are only ever legal to
+/// touch from the one thread that created them.
+///
+/// [`MicControl`] is the `Send` public face; `MicBackend` is the confined inner
+/// one. [`thread::MicHandle`] is the bridge — it owns the worker thread that
+/// owns the backend, and forwards `MicControl` calls to it over a channel.
+///
+/// The method signatures are identical to `MicControl`'s minus the `Send`
+/// bound, so the forwarding is pure delegation. Keep them in lockstep.
+pub trait MicBackend {
     fn list_devices(&self) -> Result<Vec<DeviceInfo>, AudioError>;
     fn select(&mut self, id: Option<&str>) -> Result<(), AudioError>;
     fn is_muted(&self) -> Result<bool, AudioError>;
