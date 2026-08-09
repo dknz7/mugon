@@ -20,11 +20,14 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread::JoinHandle;
 
 use windows::Win32::Foundation::{RPC_E_CHANGED_MODE, S_FALSE, S_OK};
+use windows::Win32::Media::Audio::{
+    IAudioClient, IMMDevice, AUDCLNT_SHAREMODE_SHARED,
+};
 use windows::Win32::System::Com::{
-    CoInitializeEx, CoUninitialize, COINIT_MULTITHREADED,
+    CoInitializeEx, CoTaskMemFree, CoUninitialize, CLSCTX_ALL, COINIT_MULTITHREADED,
 };
 
-use super::endpoint::Endpoint;
+use super::endpoint::{win, Endpoint};
 use super::{AudioError, DeviceInfo, MicBackend};
 
 /// The one error every "the worker is gone" path produces. Callers include
@@ -46,6 +49,12 @@ enum Command {
     Volume(Sender<Result<f32, AudioError>>),
     SetVolume(f32, Sender<Result<(), AudioError>>),
     Peak(Sender<Result<f32, AudioError>>),
+    /// Opens the worker's capture stream if one is not already open.
+    /// Idempotent — see the handler in `run` and `CaptureStream`'s docs for
+    /// why it exists and why its buffers are never read.
+    StartMetering(Sender<Result<(), AudioError>>),
+    /// Drops the worker's capture stream, if any. Idempotent.
+    StopMetering(Sender<Result<(), AudioError>>),
     Shutdown,
 }
 
@@ -142,6 +151,104 @@ impl MicBackend for MtaEndpoint {
     }
 }
 
+/// A live WASAPI capture stream, held open for exactly one reason: as long as
+/// it exists, the endpoint's `IAudioMeterInformation::GetPeakValue` keeps
+/// reporting real levels instead of the flat zero it falls back to once
+/// Windows decides nothing is listening to this endpoint (§4.7).
+///
+/// **We deliberately never call `GetBuffer`/`ReleaseBuffer` on it.** There is
+/// no read loop anywhere in this file, and that is not a bug to "fix" — the
+/// audio engine copies (and, once its ring buffer wraps, silently discards)
+/// captured frames whether or not a client ever collects them. Reading the
+/// buffers is exactly the work an `IAudioCaptureClient` read loop would need
+/// for actual recording, which this app does not do; the stream exists only
+/// to keep the meter honest.
+///
+/// Not `Send` (holds an `IAudioClient`, itself apartment-bound like every
+/// other COM interface in this tree) — but it only ever lives inside the
+/// worker's `run` loop below, on the one thread that is allowed to touch it,
+/// so that is never a problem in practice.
+pub(crate) struct CaptureStream {
+    client: IAudioClient,
+}
+
+impl CaptureStream {
+    /// One second of buffer, in 100-nanosecond units (WASAPI's native time
+    /// unit). Generous on purpose: nothing ever drains this stream early, so
+    /// the only cost of a longer buffer is a little memory, not a stall.
+    const BUFFER_DURATION_100NS: i64 = 10_000_000;
+
+    /// Activates a fresh `IAudioClient` on `device` and starts it in shared
+    /// mode using the device's own mix format, so no format negotiation is
+    /// needed. `device` is expected to be the same `IMMDevice` the caller's
+    /// meter/volume interfaces were activated from, so this stream tracks
+    /// the same endpoint currently selected — see [`Endpoint::device`].
+    fn open(device: &IMMDevice) -> Result<Self, AudioError> {
+        unsafe {
+            let client: IAudioClient = win(device.Activate(CLSCTX_ALL, None))?;
+            // `GetMixFormat` allocates with the COM task allocator; it is
+            // ours to free once `Initialize` has read it.
+            let format = win(client.GetMixFormat())?;
+            let init = client.Initialize(
+                AUDCLNT_SHAREMODE_SHARED,
+                0,
+                Self::BUFFER_DURATION_100NS,
+                0,
+                format,
+                None,
+            );
+            CoTaskMemFree(Some(format as *const std::ffi::c_void));
+            win(init)?;
+            win(client.Start())?;
+            Ok(Self { client })
+        }
+    }
+}
+
+impl Drop for CaptureStream {
+    /// Best-effort stop so the mic-in-use indicator clears. If the client is
+    /// already in a bad state there is nothing more useful to do than let it
+    /// release on drop.
+    fn drop(&mut self) {
+        unsafe {
+            let _ = self.client.Stop();
+        }
+    }
+}
+
+/// Backends that can (optionally) open a [`CaptureStream`] to keep their
+/// meter live. Only the real endpoint has anything real to open; every other
+/// backend — `FakeMic` and the test doubles in this file's own test module —
+/// gets the default, which has nothing to hold and always succeeds. That is
+/// exactly the behaviour a backend with no real audio stream should have:
+/// `StartMetering`/`StopMetering` become harmless no-ops rather than errors.
+///
+/// `pub(crate)` rather than private: `spawn_with` below is `pub(crate)` (so
+/// `meter.rs`'s tests can use it), and a bound on a `pub(crate)` function
+/// cannot be more private than the function itself.
+pub(crate) trait MeterCapture: MicBackend {
+    fn open_capture_stream(&self) -> Result<Option<CaptureStream>, AudioError> {
+        Ok(None)
+    }
+}
+
+impl MeterCapture for MtaEndpoint {
+    /// Opens a stream against the same device the endpoint's volume/meter
+    /// interfaces already track (see [`Endpoint::device`]) — never a second,
+    /// independently constructed endpoint.
+    fn open_capture_stream(&self) -> Result<Option<CaptureStream>, AudioError> {
+        CaptureStream::open(self.endpoint.device()).map(Some)
+    }
+}
+
+/// `FakeMic` has no real audio to capture, so it gets the trivial default:
+/// nothing to open, always succeeds. Implemented here (rather than in
+/// `fake.rs`) because [`MeterCapture`] is private to this module — the
+/// orphan rule only requires the trait or the type to be local, and both are,
+/// so this is a perfectly ordinary same-crate impl.
+#[cfg(test)]
+impl MeterCapture for super::fake::FakeMic {}
+
 /// A `Send` proxy for a thread-confined [`MicBackend`].
 ///
 /// Holds only channel endpoints, so `Send` falls out of the field types — see
@@ -179,9 +286,13 @@ impl MicHandle {
     ///
     /// The factory runs there rather than the caller passing a built backend,
     /// because a real `Endpoint` is `!Send` and could not cross the boundary.
-    fn spawn_with<B, F>(make: F) -> Result<Self, AudioError>
+    ///
+    /// `pub(crate)` rather than private: `meter.rs`'s tests need a
+    /// fake-backed worker too, and this is the same seam this module's own
+    /// tests already use, not a new one grown just for them.
+    pub(crate) fn spawn_with<B, F>(make: F) -> Result<Self, AudioError>
     where
-        B: MicBackend + 'static,
+        B: MicBackend + MeterCapture + 'static,
         F: FnOnce() -> Result<B, AudioError> + Send + 'static,
     {
         let (tx, rx) = mpsc::channel::<Command>();
@@ -210,13 +321,89 @@ impl MicHandle {
     /// Every call goes through here: build a reply channel, send, block on the
     /// reply. Both the send and the receive degrade to [`worker_gone`] — there
     /// is deliberately no `unwrap` on any channel operation in this file.
+    ///
+    /// Thin wrapper over the free [`send_command`] function, which is the
+    /// actual funnel: [`MicTap`] shares it too, so there is exactly one copy
+    /// of this send/reply logic in the whole file, not one per handle type.
     fn call<T>(
         &self,
         build: impl FnOnce(Sender<Result<T, AudioError>>) -> Command,
     ) -> Result<T, AudioError> {
-        let (reply_tx, reply_rx) = mpsc::channel();
-        self.tx.send(build(reply_tx)).map_err(|_| worker_gone())?;
-        reply_rx.recv().map_err(|_| worker_gone())?
+        send_command(&self.tx, build)
+    }
+
+    /// A cheap, cloneable, read-only view onto this worker. Used by the level
+    /// meter (`meter::MeterHandle`), which only ever needs to read peak
+    /// values and toggle the capture stream — never to mute or select a
+    /// device — and which must be able to hand out its own clones without
+    /// going anywhere near `MicHandle`'s single-ownership `Drop`.
+    pub fn tap(&self) -> MicTap {
+        MicTap { tx: self.tx.clone() }
+    }
+
+    /// Opens the worker's capture stream if one is not already open, so the
+    /// endpoint's meter stays live. See `Command::StartMetering` and
+    /// [`CaptureStream`] for why. Idempotent, and a failure here is never
+    /// fatal to the caller — it degrades to passive polling.
+    pub fn start_metering(&self) -> Result<(), AudioError> {
+        self.call(Command::StartMetering)
+    }
+
+    /// Drops the worker's capture stream, if any. Idempotent.
+    pub fn stop_metering(&self) -> Result<(), AudioError> {
+        self.call(Command::StopMetering)
+    }
+}
+
+/// The single channel funnel every command goes through, shared by
+/// [`MicHandle::call`] and every [`MicTap`] method. Both the send and the
+/// receive degrade to [`worker_gone`] rather than ever unwrapping — this is
+/// the one place that property has to hold for it to hold everywhere.
+fn send_command<T>(
+    tx: &Sender<Command>,
+    build: impl FnOnce(Sender<Result<T, AudioError>>) -> Command,
+) -> Result<T, AudioError> {
+    let (reply_tx, reply_rx) = mpsc::channel();
+    tx.send(build(reply_tx)).map_err(|_| worker_gone())?;
+    reply_rx.recv().map_err(|_| worker_gone())?
+}
+
+/// A cloneable, read-only view of the audio worker. Holds only a command
+/// sender, so it is cheap to clone and `Send` falls out of its field types —
+/// see the compile-time assertion below. Cannot mutate mic state (mute,
+/// volume, device selection): the meter has no business touching any of
+/// that. It *can* toggle the capture stream, because that is meter plumbing,
+/// not device state — opening or closing a stream never mutes or unmutes
+/// anything, it only affects whether the meter reads live values or zero.
+#[derive(Clone)]
+pub struct MicTap {
+    tx: Sender<Command>,
+}
+
+const _: fn() = || {
+    fn assert_send<T: Send>() {}
+    fn assert_clone<T: Clone>() {}
+    assert_send::<MicTap>();
+    assert_clone::<MicTap>();
+};
+
+impl MicTap {
+    /// Same call/reply shape as every `MicHandle` method — funnelled through
+    /// the same [`send_command`] helper, not a second copy of it.
+    pub fn peak(&self) -> Result<f32, AudioError> {
+        send_command(&self.tx, Command::Peak)
+    }
+
+    /// See [`MicHandle::start_metering`]. Exposed here too because
+    /// `meter::MeterHandle` only ever holds a `MicTap`, never a `MicHandle` —
+    /// see the module docs on `meter.rs` for why.
+    pub fn start_metering(&self) -> Result<(), AudioError> {
+        send_command(&self.tx, Command::StartMetering)
+    }
+
+    /// See [`MicHandle::stop_metering`].
+    pub fn stop_metering(&self) -> Result<(), AudioError> {
+        send_command(&self.tx, Command::StopMetering)
     }
 }
 
@@ -264,7 +451,7 @@ impl Drop for MicHandle {
 /// The worker thread body: construct, report, serve, tear down.
 fn run<B, F>(make: F, ready: Sender<Result<(), AudioError>>, rx: Receiver<Command>)
 where
-    B: MicBackend,
+    B: MicBackend + MeterCapture,
     F: FnOnce() -> Result<B, AudioError>,
 {
     let mut backend = match make() {
@@ -282,6 +469,13 @@ where
             return;
         }
     };
+
+    // Declared after `backend` so it drops *before* `backend` at function
+    // exit (locals drop in reverse declaration order) — the capture stream
+    // stops before the endpoint (and, for the real backend, the COM
+    // apartment) tears down, on every exit path: `Shutdown`, a disconnected
+    // channel, or an explicit `StopMetering`.
+    let mut capture: Option<CaptureStream> = None;
 
     // `recv` returning `Err` means every sender is gone — the handle was
     // dropped without a clean shutdown. Same exit path either way.
@@ -308,10 +502,36 @@ where
             Command::Peak(reply) => {
                 let _ = reply.send(backend.peak());
             }
+            Command::StartMetering(reply) => {
+                let result = if capture.is_some() {
+                    Ok(())
+                } else {
+                    match backend.open_capture_stream() {
+                        Ok(stream) => {
+                            capture = stream;
+                            Ok(())
+                        }
+                        // Not fatal: log and let the meter fall back to
+                        // passive polling, which reads zero unless something
+                        // else happens to be capturing. See the module docs
+                        // on `CaptureStream` for why this is acceptable.
+                        Err(e) => {
+                            eprintln!("mugon: failed to open capture stream for metering: {e}");
+                            Err(e)
+                        }
+                    }
+                };
+                let _ = reply.send(result);
+            }
+            Command::StopMetering(reply) => {
+                capture = None;
+                let _ = reply.send(Ok(()));
+            }
             Command::Shutdown => break,
         }
     }
-    // `backend` drops here, releasing the COM interfaces and then the apartment.
+    // `capture` drops here first (stopping any open stream), then `backend`,
+    // releasing the COM interfaces and then the apartment.
 }
 
 #[cfg(test)]
@@ -372,6 +592,9 @@ mod tests {
             self.with(|m| m.peak())?
         }
     }
+
+    /// Nothing real to open; takes the trivial default (see [`MeterCapture`]).
+    impl MeterCapture for SharedFake {}
 
     /// Spawns a worker over a shared `FakeMic` and returns the handle plus a
     /// window onto the fake's recorded state.
@@ -495,6 +718,9 @@ mod tests {
             Ok(0.0)
         }
     }
+
+    /// Nothing real to open; takes the trivial default (see [`MeterCapture`]).
+    impl MeterCapture for PanickingFake {}
 
     /// The panic hook is process-global, so the two tests that deliberately
     /// panic a worker serialise on this and put the previous hook back.
@@ -654,6 +880,134 @@ mod tests {
         after_select.expect("endpoint must still work after select");
 
         // Drop joins the worker, which drops the endpoint and leaves the MTA.
+        drop(mic);
+    }
+
+    #[test]
+    fn mic_tap_peak_returns_the_backends_value_through_the_channel() {
+        let (mic, view) = spawn_fake();
+        let tap = mic.tap();
+
+        view.lock().unwrap().peak = 0.42;
+        assert!((tap.peak().unwrap() - 0.42).abs() < 1e-6);
+
+        view.lock().unwrap().peak = 0.0;
+        assert_eq!(tap.peak().unwrap(), 0.0);
+    }
+
+    /// A tap must be usable from another thread and cloneable without
+    /// touching the worker — both fall out of holding nothing but a
+    /// `Sender<Command>`, but that is exactly the property a future field
+    /// addition could quietly break, so it is asserted at compile time (see
+    /// the `const _` block by `MicTap`'s definition) and exercised here at
+    /// runtime.
+    #[test]
+    fn mic_tap_is_cloneable_and_usable_from_another_thread() {
+        let (mic, view) = spawn_fake();
+        view.lock().unwrap().peak = 0.75;
+        let tap = mic.tap();
+        let tap2 = tap.clone();
+
+        let handle = std::thread::spawn(move || tap2.peak());
+        assert!((tap.peak().unwrap() - 0.75).abs() < 1e-6);
+        assert!((handle.join().unwrap().unwrap() - 0.75).abs() < 1e-6);
+    }
+
+    #[test]
+    fn a_tap_on_a_dead_worker_errors_instead_of_hanging_or_panicking() {
+        let (mic, _view) = spawn_fake();
+        let tap = mic.tap();
+
+        // Kill the worker deterministically, same idiom as
+        // `a_dead_worker_degrades_to_an_error_on_every_path` above.
+        drop(mic);
+
+        match tap.peak() {
+            Err(AudioError::Windows(msg)) => {
+                assert!(msg.contains("audio thread terminated"), "got {msg}");
+            }
+            other => panic!("expected a dead-worker error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn start_and_stop_metering_are_idempotent() {
+        let (mic, _view) = spawn_fake();
+
+        // `FakeMic` has nothing real to open (see `MeterCapture`'s default),
+        // so both calls succeed trivially both times: idempotent means
+        // "calling twice is not an error", and that holds here regardless of
+        // which of the two calls actually happened first.
+        mic.start_metering().unwrap();
+        mic.start_metering().unwrap();
+        mic.stop_metering().unwrap();
+        mic.stop_metering().unwrap();
+
+        // And through the tap, which shares the same commands.
+        let tap = mic.tap();
+        tap.start_metering().unwrap();
+        tap.start_metering().unwrap();
+        tap.stop_metering().unwrap();
+        tap.stop_metering().unwrap();
+    }
+
+    /// The ambiguity this project's Task 8 brief flagged directly: a live
+    /// `MicTap` keeps the command channel from *disconnecting*, so the
+    /// worker cannot rely on "every sender dropped" to know when to exit
+    /// while a tap is still alive. `MicHandle::drop` sidesteps that by
+    /// sending an explicit `Shutdown` first — this test proves that holds
+    /// even when a tap is mid-`peak()` call at the exact moment the handle
+    /// drops, by racing the two on separate threads.
+    ///
+    /// If a regression ever reintroduces a hang here, this test must not
+    /// hang the whole suite with it — the background thread reports back
+    /// over a channel with a bounded `recv_timeout` instead of being joined
+    /// directly, so a real deadlock fails loudly instead of freezing CI.
+    #[test]
+    fn dropping_the_handle_while_a_tap_is_mid_poll_does_not_hang() {
+        let (mic, _view) = spawn_fake();
+        let tap = mic.tap();
+
+        let (done_tx, done_rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            // Hammer `peak()` so at least one call is in flight (send issued,
+            // reply pending) at the moment `mic` drops below. Every outcome
+            // — `Ok` before shutdown, `Err` once the worker is gone — is
+            // acceptable; the only failure mode this guards against is the
+            // call never returning at all.
+            for _ in 0..20_000 {
+                let _ = tap.peak();
+            }
+            let _ = done_tx.send(());
+        });
+
+        drop(mic);
+
+        done_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("a MicTap::peak() call hung across worker shutdown — this is a real deadlock");
+    }
+
+    #[test]
+    #[ignore = "requires real audio hardware; run with --ignored"]
+    fn real_capture_stream_keeps_the_meter_live_and_releases_cleanly() {
+        let mic = MicHandle::spawn().expect("no capture endpoint");
+        let tap = mic.tap();
+
+        tap.start_metering().expect("capture stream must open on real hardware");
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let peak = tap.peak().expect("peak through the tap");
+        println!("peak with capture stream open: {peak}");
+        assert!((0.0..=1.0).contains(&peak), "peak out of range: {peak}");
+
+        tap.stop_metering().expect("capture stream must close");
+
+        // Re-opening cleanly after a stop is the evidence the previous
+        // stream was actually released rather than left half torn-down.
+        tap.start_metering().expect("must be able to reopen after stop");
+        tap.stop_metering().expect("second stop must also succeed");
+
+        // Metering never touches mute state; nothing to restore here.
         drop(mic);
     }
 }

@@ -39,7 +39,10 @@ use windows::Win32::System::Com::{
 };
 use windows::Win32::System::Variant::VT_LPWSTR;
 
-fn win<T>(r: windows::core::Result<T>) -> Result<T, AudioError> {
+/// `pub(crate)` (not private) so `thread.rs` can reuse it for the WASAPI
+/// calls its capture-stream plumbing makes directly against the endpoint's
+/// device — see `thread::CaptureStream`.
+pub(crate) fn win<T>(r: windows::core::Result<T>) -> Result<T, AudioError> {
     r.map_err(|e| AudioError::Windows(e.to_string()))
 }
 
@@ -154,6 +157,19 @@ impl Endpoint {
         let id = raw.to_string();
         CoTaskMemFree(Some(raw.as_ptr() as *const core::ffi::c_void));
         id.map_err(|e| AudioError::Windows(e.to_string()))
+    }
+
+    /// The live device the volume/meter interfaces were activated from.
+    ///
+    /// `pub(crate)` so the worker thread's metering plumbing (`thread.rs`)
+    /// can open a WASAPI capture stream against the *same* endpoint the
+    /// meter already tracks, without constructing a second `Endpoint` or
+    /// duplicating any enumerator/activation logic here. This does not widen
+    /// who may construct or move an `Endpoint` — it only hands out a
+    /// reference, and only within the crate, and only to code that already
+    /// runs on this endpoint's own confined worker thread.
+    pub(crate) fn device(&self) -> &IMMDevice {
+        &self.device
     }
 
     /// Re-resolves `selected_id` to a live device. Called after a hotplug event

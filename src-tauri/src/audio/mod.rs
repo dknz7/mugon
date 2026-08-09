@@ -1,6 +1,7 @@
 pub mod endpoint;
 #[cfg(test)]
 pub mod fake;
+pub mod meter;
 pub mod thread;
 
 use serde::Serialize;
