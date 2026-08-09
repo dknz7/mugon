@@ -1,6 +1,8 @@
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 pub mod keys;
+pub mod hook;
+pub mod recorder;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Hotkey {
