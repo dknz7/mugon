@@ -65,6 +65,22 @@ impl<'de> Deserialize<'de> for Hotkey {
         let r = HotkeyRepr::deserialize(d)?;
         let vk = keys::name_to_vk(&r.key)
             .ok_or_else(|| serde::de::Error::custom(format!("unknown key name {:?}", r.key)))?;
+        // A binding's key must never be a modifier (e.g. "LeftCtrl"). The
+        // keyboard hook (hotkey::hook) swallows the physical key its binding
+        // names on every matching press; a modifier-named binding would make
+        // it swallow bare Ctrl/Alt/Shift/Win system-wide, breaking every
+        // other shortcut on the machine. This is the config-file half of
+        // that invariant — `Recorder::feed` (recorder.rs) is the other half,
+        // rejecting modifiers as they're pressed during recording. Corrupt
+        // or hand-edited config containing a modifier key name must fail to
+        // deserialize so `Config::load` falls back to defaults instead of
+        // ever handing the hook a modifier binding.
+        if keys::is_modifier(vk) {
+            return Err(serde::de::Error::custom(format!(
+                "key {:?} is a modifier and cannot be a hotkey binding",
+                r.key
+            )));
+        }
         Ok(Hotkey { ctrl: r.ctrl, alt: r.alt, shift: r.shift, win: r.win, vk })
     }
 }
@@ -97,6 +113,16 @@ mod tests {
     #[test]
     fn deserializing_unknown_key_name_fails_cleanly() {
         let json = r#"{"ctrl":false,"alt":false,"shift":false,"win":false,"key":"Nonsense"}"#;
+        assert!(serde_json::from_str::<Hotkey>(json).is_err());
+    }
+
+    #[test]
+    fn deserializing_a_modifier_key_name_fails() {
+        // A hand-edited or corrupted config naming a modifier as the bound key
+        // (e.g. "LeftCtrl") must not deserialize into a Hotkey: the keyboard
+        // hook would swallow that modifier system-wide. Config::load's
+        // fallback-to-defaults-on-error path handles the failure safely.
+        let json = r#"{"ctrl":false,"alt":false,"shift":false,"win":false,"key":"LeftCtrl"}"#;
         assert!(serde_json::from_str::<Hotkey>(json).is_err());
     }
 
