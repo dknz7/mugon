@@ -31,7 +31,7 @@ pub struct ModeMachine<M: MicControl> {
 impl<M: MicControl> ModeMachine<M> {
     pub fn new(mic: M, mode: Mode) -> Self {
         let mut m = Self { mic, mode, held: false };
-        m.apply_resting_state();
+        m.reapply_resting_state();
         m
     }
 
@@ -46,9 +46,25 @@ impl<M: MicControl> ModeMachine<M> {
         self.mode == Mode::MuteToggle
     }
 
-    /// PTT rests muted; Mute Toggle rests unmuted. Applied on construction and
-    /// on every mode change (§4.2).
-    fn apply_resting_state(&mut self) {
+    /// PTT rests muted; Mute Toggle rests unmuted. Applied on construction, on
+    /// every mode change (§4.2), and — this is why it is public — after the
+    /// mic is re-pointed at a different device.
+    ///
+    /// The resting state is a property of the **endpoint**, not of this
+    /// machine. `MicControl::select` moves the mic to a device sitting at
+    /// whatever mute state Windows last left it in, while the old device keeps
+    /// the state this machine set. In Push to Talk that is the dangerous
+    /// direction: the user believes they are muted at rest and the newly
+    /// selected device is live. Whoever calls `select` must call this
+    /// immediately afterwards.
+    ///
+    /// Known wart, deliberately not handled: called mid-hold in PTT (the user
+    /// changes device while holding the key) this mutes a device that should be
+    /// live. It self-corrects on the next press, and it fails *muted* rather
+    /// than *hot*, which is the direction this app should fail in.
+    ///
+    /// Idempotent, and safe to call in any mode.
+    pub fn reapply_resting_state(&mut self) {
         let muted = self.mode == Mode::PushToTalk;
         let _ = self.mic.set_muted(muted);
     }
@@ -59,7 +75,7 @@ impl<M: MicControl> ModeMachine<M> {
         }
         self.mode = mode;
         self.held = false;
-        self.apply_resting_state();
+        self.reapply_resting_state();
     }
 
     pub fn on_key(&mut self, edge: KeyEdge) {
@@ -200,6 +216,38 @@ mod tests {
         m.set_mode(Mode::MuteToggle);
         assert!(!m.is_held(), "hold state must not survive a mode change");
         assert!(!m.mic().muted);
+    }
+
+    /// The device-change hazard. A newly selected endpoint arrives at whatever
+    /// mute state Windows last left it in — `FakeMic::select` cannot model that
+    /// on its own, so the new device's live state is set directly here. In PTT
+    /// the machine must pull it back to muted, or the user is hot while
+    /// believing they are muted at rest.
+    #[test]
+    fn reapplying_the_resting_state_mutes_a_newly_selected_device_in_ptt() {
+        let mut m = machine(Mode::PushToTalk);
+        assert!(m.mic().muted, "PTT rests muted on the original device");
+
+        m.mic_mut().selected = Some("device-2".into());
+        m.mic_mut().muted = false; // the new endpoint is live
+        m.mic_mut().mute_calls.clear();
+
+        m.reapply_resting_state();
+        assert!(m.mic().muted, "the newly selected device must be muted at rest in PTT");
+        assert_eq!(m.mic().mute_calls, vec![true]);
+    }
+
+    #[test]
+    fn reapplying_the_resting_state_unmutes_a_newly_selected_device_in_mute_toggle() {
+        let mut m = machine(Mode::MuteToggle);
+
+        m.mic_mut().selected = Some("device-2".into());
+        m.mic_mut().muted = true; // the new endpoint arrives muted
+        m.mic_mut().mute_calls.clear();
+
+        m.reapply_resting_state();
+        assert!(!m.mic().muted, "Mute Toggle rests unmuted");
+        assert_eq!(m.mic().mute_calls, vec![false]);
     }
 
     #[test]

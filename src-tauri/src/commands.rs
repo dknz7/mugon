@@ -7,7 +7,7 @@
 
 use tauri::{AppHandle, State};
 
-use crate::audio::MicBackend;
+use crate::audio::{DeviceInfo, MicBackend};
 use crate::modes::Mode;
 use crate::state::{emit_state, lock_or_recover, AppState, Shared};
 
@@ -16,18 +16,33 @@ pub fn get_state(core: State<Shared>) -> AppState {
     lock_or_recover(&core).snapshot()
 }
 
+/// Enumerates capture endpoints (DESIGN.md §3).
+///
+/// Separate from `get_state` because it is expensive — a full COM enumeration
+/// plus a friendly-name property read per device — and because the answer
+/// changes on hotplug, not on every mute. Call it on window open and on
+/// `devices-changed`, not on every render. See [`AppState`]'s docs.
+///
+/// Returns an empty list rather than an error on failure; the reason lands in
+/// `last_error` and rides out on the `state-changed` this emits.
+#[tauri::command]
+pub fn list_devices(app: AppHandle, core: State<Shared>) -> Vec<DeviceInfo> {
+    let devices = {
+        let mut c = lock_or_recover(&core);
+        let result = c.machine.mic().list_devices();
+        c.record_outcome(&result);
+        result.unwrap_or_default()
+    };
+    emit_state(&app);
+    devices
+}
+
 #[tauri::command]
 pub fn set_device(app: AppHandle, core: State<Shared>, id: Option<String>) {
-    {
-        let mut c = lock_or_recover(&core);
-        let result = c.machine.mic_mut().select(id.as_deref());
-        c.record_outcome(&result);
-        // Persisted even when the selection failed: the user asked for this
-        // device, and a device that is merely unplugged right now should come
-        // back on the next launch rather than being silently forgotten.
-        c.config.device_id = id;
-        c.persist();
-    }
+    // The select, the resting-state reassertion and the persist are one unit
+    // in `Core::select_device` so they can be tested together — getting the
+    // reassertion wrong leaves a push-to-talk user hot. See its docs.
+    lock_or_recover(&core).select_device(id);
     emit_state(&app);
 }
 
@@ -113,12 +128,18 @@ pub fn set_autostart(app: AppHandle, core: State<Shared>, enabled: bool) -> Resu
     // Deliberately outside the lock: writing the Run key is registry I/O with
     // no need for `Core`, and the config must only record what actually took
     // effect.
-    crate::autostart::set(&app, enabled)?;
+    let result = crate::autostart::set(&app, enabled);
     {
         let mut c = lock_or_recover(&core);
-        c.config.autostart = enabled;
-        c.persist();
+        // Routed through `last_error` as well as the `Result`, so Task 14 has
+        // exactly one place to look for "the last thing that failed" rather
+        // than one field plus a per-command rejection to remember.
+        c.last_error = result.clone().err();
+        if result.is_ok() {
+            c.config.autostart = enabled;
+            c.persist();
+        }
     }
     emit_state(&app);
-    Ok(())
+    result
 }

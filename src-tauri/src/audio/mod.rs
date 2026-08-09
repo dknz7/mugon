@@ -23,6 +23,18 @@ pub enum AudioError {
     /// through `AppState.last_error` and deliberately does not respawn.
     #[error("audio thread terminated")]
     ThreadTerminated,
+    /// The audio worker accepted a command and never replied within
+    /// [`thread::COMMAND_TIMEOUT`] — it is alive but wedged, almost certainly
+    /// inside a COM call that is not coming back.
+    ///
+    /// Distinct from [`AudioError::ThreadTerminated`] because a dead worker
+    /// disconnects its channels and unblocks its callers for free, whereas a
+    /// hung one blocks them forever unless something bounds the wait. Tauri
+    /// runs sync commands on the main thread, so an unbounded wait here would
+    /// freeze the UI *while holding the `Core` lock* and take the tray's Quit
+    /// item down with it.
+    #[error("audio thread did not respond within {0:?}")]
+    Timeout(std::time::Duration),
     #[error("windows audio error: {0}")]
     Windows(String),
 }

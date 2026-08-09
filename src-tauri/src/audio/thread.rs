@@ -18,6 +18,7 @@
 use std::marker::PhantomData;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread::JoinHandle;
+use std::time::Duration;
 
 use windows::Win32::Foundation::{RPC_E_CHANGED_MODE, S_FALSE, S_OK};
 use windows::Win32::Media::Audio::{
@@ -361,17 +362,34 @@ impl MicHandle {
     }
 }
 
+/// How long a caller waits for the worker to answer one command.
+///
+/// Core Audio calls are milliseconds; five seconds means something is
+/// genuinely broken, not merely slow. The bound exists because a *hung* worker
+/// is a different failure from a *dead* one: death disconnects the reply
+/// channel and unblocks the caller for free, while a hang inside a COM call
+/// blocks forever. Tauri runs sync commands on the main thread and every
+/// command holds the `Core` lock across this call, so an unbounded wait would
+/// freeze the UI, stall the hook-dispatch thread behind the same lock, and
+/// leave no path to the tray's Quit item.
+pub const COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// The single channel funnel every command goes through, shared by
-/// [`MicHandle::call`] and every [`MeterTap`] method. Both the send and the
-/// receive degrade to [`worker_gone`] rather than ever unwrapping — this is
-/// the one place that property has to hold for it to hold everywhere.
+/// [`MicHandle::call`] and every [`MeterTap`] method. The send, the receive
+/// and the timeout all degrade to an error rather than ever unwrapping or
+/// blocking indefinitely — this is the one place those properties have to hold
+/// for them to hold everywhere.
 fn send_command<T>(
     tx: &Sender<Command>,
     build: impl FnOnce(Sender<Result<T, AudioError>>) -> Command,
 ) -> Result<T, AudioError> {
     let (reply_tx, reply_rx) = mpsc::channel();
     tx.send(build(reply_tx)).map_err(|_| worker_gone())?;
-    reply_rx.recv().map_err(|_| worker_gone())?
+    match reply_rx.recv_timeout(COMMAND_TIMEOUT) {
+        Ok(result) => result,
+        Err(mpsc::RecvTimeoutError::Timeout) => Err(AudioError::Timeout(COMMAND_TIMEOUT)),
+        Err(mpsc::RecvTimeoutError::Disconnected) => Err(worker_gone()),
+    }
 }
 
 /// The audio worker's *metering* capability: observe levels and control the
@@ -886,6 +904,73 @@ mod tests {
             Err(other) => panic!("expected a dead-worker error, got {other:?}"),
             Ok(_) => panic!("spawn must not hand back a handle to a dead worker"),
         }
+    }
+
+    /// A backend that hangs *inside* a call until the test lets it go.
+    ///
+    /// This models the failure [`COMMAND_TIMEOUT`] exists for and the one a
+    /// disconnected channel cannot detect: the worker is alive, its channels
+    /// are connected, and the reply is simply never coming. Every other fake
+    /// in this file either answers or dies.
+    struct WedgedFake {
+        release: Receiver<()>,
+    }
+
+    impl MicBackend for WedgedFake {
+        fn list_devices(&self) -> Result<Vec<DeviceInfo>, AudioError> {
+            Ok(Vec::new())
+        }
+        fn select(&mut self, _id: Option<&str>) -> Result<(), AudioError> {
+            Ok(())
+        }
+        fn is_muted(&self) -> Result<bool, AudioError> {
+            // Blocks until the test releases it, or forever if it does not.
+            let _ = self.release.recv();
+            Ok(false)
+        }
+        fn set_muted(&mut self, _muted: bool) -> Result<(), AudioError> {
+            Ok(())
+        }
+        fn volume(&self) -> Result<f32, AudioError> {
+            Ok(0.0)
+        }
+        fn set_volume(&mut self, _level: f32) -> Result<(), AudioError> {
+            Ok(())
+        }
+        fn peak(&self) -> Result<f32, AudioError> {
+            Ok(0.0)
+        }
+    }
+
+    impl MeterCapture for WedgedFake {
+        type Stream = ();
+    }
+
+    /// The property: a caller waiting on a worker that never replies gets an
+    /// error, not a permanent block. Without the bound this test would hang
+    /// the suite — which is exactly what it would do to the UI thread, while
+    /// holding the `Core` lock, in production.
+    #[test]
+    fn a_wedged_worker_times_out_instead_of_blocking_the_caller_forever() {
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let mic =
+            MicHandle::spawn_with(move || Ok(WedgedFake { release: release_rx })).expect("must spawn");
+
+        let started = std::time::Instant::now();
+        let result = mic.is_muted();
+        let elapsed = started.elapsed();
+
+        match result {
+            Err(AudioError::Timeout(bound)) => assert_eq!(bound, COMMAND_TIMEOUT),
+            other => panic!("expected a timeout, got {other:?}"),
+        }
+        assert!(elapsed >= COMMAND_TIMEOUT, "returned before the bound elapsed: {elapsed:?}");
+
+        // Let the worker out before dropping the handle: `MicHandle::drop`
+        // joins the thread, so a still-wedged worker would hang this test
+        // rather than fail it.
+        let _ = release_tx.send(());
+        drop(mic);
     }
 
     #[test]

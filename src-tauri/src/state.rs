@@ -3,23 +3,43 @@
 //!
 //! # Locking discipline
 //!
-//! Exactly one mutex guards mutable app state: [`Shared`] (`Mutex<Core>`).
-//! Two rules keep it deadlock-free, and both are load-bearing:
+//! Two mutexes guard mutable app state: [`Shared`] (`Mutex<Core>`) and
+//! [`Meter`] (`Mutex<MeterHandle>`). Four rules keep them deadlock-free, and
+//! every one of them is load-bearing.
 //!
-//! 1. **The audio worker never takes the `Core` lock.** It owns a `!Send`
-//!    Core Audio endpoint and services commands over a channel
-//!    ([`crate::audio::thread`]); it has no `AppHandle` and no way to reach
-//!    `Core`. So holding `Core` while blocking on an audio reply cannot
-//!    cycle — the reply does not need `Core` to be produced.
-//! 2. **The 30Hz level meter never takes the `Core` lock either.** It polls
-//!    through a [`MeterTap`], which is a bare channel sender onto the same
-//!    worker. Keep it that way: a meter that needed `Core` would be taking
-//!    the lock 30 times a second against every command handler.
+//! **1. Lock order is `Core` before [`Meter`]. Never the reverse.**
+//! Today nothing holds both at once — `lib.rs`'s `setup` releases the `Core`
+//! guard before taking the meter's. That will not survive Task 10, which wires
+//! `MeterHandle::start`/`stop` to window show/hide: getting the [`MeterTap`] to
+//! start with requires `Core`, so that code *will* hold both. When it does, it
+//! must take them in this order, because there is no ordering to discover from
+//! the code once two call sites disagree.
 //!
-//! [`emit_state`] takes the lock to build its snapshot, so it must never be
-//! called while a guard is already held. Command bodies scope their guard in
-//! an inner block and call it after.
+//! **2. The audio worker never takes the `Core` lock.** It owns a `!Send` Core
+//! Audio endpoint and services commands over a channel
+//! ([`crate::audio::thread`]); it has no `AppHandle` and no way to reach
+//! `Core`. So holding `Core` while blocking on an audio reply cannot cycle —
+//! the reply does not need `Core` to be produced. Those replies are bounded by
+//! [`crate::audio::thread::COMMAND_TIMEOUT`] anyway, so even a wedged worker
+//! releases the lock eventually.
+//!
+//! **3. The 30Hz level meter never takes the `Core` lock either.** It polls
+//! through a [`MeterTap`], which is a bare channel sender onto the same worker.
+//! Keep it that way: a meter that needed `Core` would be taking the lock 30
+//! times a second against every command handler.
+//!
+//! **4. [`emit_state`] takes the lock to build its snapshot**, so it must never
+//! be called while a guard is already held. Command bodies scope their guard in
+//! an inner block and call it after; the hook dispatch loop returns a
+//! description of its follow-up work instead of doing it inline.
+//!
+//! One extra caution for Task 10: `MeterHandle::start` blocks on an audio
+//! round-trip (it opens the capture stream) and `stop` joins the poll thread.
+//! Doing either on the UI thread while holding `Core` compounds every other
+//! cost on this list — prefer releasing `Core` first, which is possible because
+//! a [`MeterTap`] is cloneable and can be taken out of the guard.
 
+use std::path::PathBuf;
 use std::sync::mpsc;
 use std::sync::{Mutex, MutexGuard};
 use std::time::Duration;
@@ -27,6 +47,7 @@ use std::time::Duration;
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager};
 
+use crate::audio::meter::MeterHandle;
 use crate::audio::thread::{MeterTap, MicHandle};
 use crate::audio::{AudioError, DeviceInfo, MicBackend};
 use crate::config::{Config, NotificationPrefs};
@@ -121,9 +142,18 @@ impl MicBackend for Mic {
 ///
 /// Task 14 mirrors this field-for-field; `tests::app_state_wire_format_is_pinned`
 /// is what notices when the two drift.
+///
+/// **The device *list* is deliberately not here.** This struct is rebuilt and
+/// emitted on every state change, which includes every push-to-talk keypress.
+/// Enumerating endpoints costs `GetDefaultAudioEndpoint` +
+/// `EnumAudioEndpoints` + a friendly-name property read per device, all on the
+/// single-threaded audio worker that is simultaneously serving the 30Hz meter,
+/// with the `Core` lock held throughout. The list changes on hotplug, not on
+/// keypress, so it belongs behind the separate `list_devices` command
+/// (DESIGN.md §3) that the frontend calls on window open and on
+/// `devices-changed`.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct AppState {
-    pub devices: Vec<DeviceInfo>,
     pub selected_device: Option<String>,
     pub mode: Mode,
     pub muted: bool,
@@ -137,13 +167,29 @@ pub struct AppState {
     /// The last device failure, or `None` if the last audio call succeeded.
     /// One field, no history, no severity — enough for the UI to say "that
     /// didn't work, and here's why" instead of nothing at all.
+    ///
+    /// **Dismissal semantics, because they are not what a reader assumes:**
+    /// this clears only when a *subsequent fallible operation succeeds* — an
+    /// audio call, or the autostart registry write. Commands that cannot fail
+    /// — `set_notification_prefs`, `clear_hotkey`, `begin_hotkey_recording`,
+    /// `cancel_hotkey_recording` — leave it exactly as they found it, so an
+    /// error stays pinned across any number of them until something actually
+    /// talks to the device again. There is no user-dismiss path and no
+    /// timestamp. Task 14 should render it as "the last thing that went wrong",
+    /// not as "something is wrong right now".
     pub last_error: Option<String>,
 }
 
 pub struct Core {
     pub machine: ModeMachine<Mic>,
     pub config: Config,
+    /// Where [`Self::persist`] writes. Held rather than re-derived from
+    /// `config_dir()` on every save so that the destination is injectable —
+    /// which is what lets the tests below exercise the persisting paths
+    /// without writing to the developer's real `%APPDATA%`.
+    pub config_dir: PathBuf,
     pub recorder: Recorder,
+    /// See [`AppState::last_error`] for the dismissal semantics.
     pub last_error: Option<String>,
 }
 
@@ -158,7 +204,6 @@ impl Core {
     /// would wipe the very error it was emitted to deliver.
     pub fn snapshot(&self) -> AppState {
         AppState {
-            devices: self.machine.mic().list_devices().unwrap_or_default(),
             selected_device: self.config.device_id.clone(),
             mode: self.machine.mode(),
             muted: self.machine.mic().is_muted().unwrap_or(false),
@@ -202,16 +247,47 @@ impl Core {
         self.record_outcome(&result);
     }
 
+    /// Re-points the microphone at `id` and re-asserts the mode's resting
+    /// state on the device that just arrived.
+    ///
+    /// The whole of `commands::set_device` minus the Tauri plumbing, so the
+    /// sequencing below is unit-testable rather than only reachable through an
+    /// IPC call.
+    ///
+    /// The `reapply_resting_state` is the load-bearing half. A newly selected
+    /// endpoint sits at whatever mute state Windows last left it in, while the
+    /// old one keeps the state the machine set. Without the reassertion, a
+    /// device change in Push to Talk leaves the *old* device muted and the
+    /// *new* one live — the user believes they are muted at rest and is hot.
+    pub fn select_device(&mut self, id: Option<String>) {
+        let result = self.machine.mic_mut().select(id.as_deref());
+        if result.is_ok() {
+            self.machine.reapply_resting_state();
+        }
+        self.record_outcome(&result);
+        // Persisted even when the selection failed: the user asked for this
+        // device, and one that is merely unplugged right now should come back
+        // on the next launch rather than being silently forgotten.
+        self.config.device_id = id;
+        self.persist();
+    }
+
     /// Persists config. Failures are logged, never fatal — a read-only
     /// `%APPDATA%` must not take the app down (DESIGN.md §6).
     pub fn persist(&self) {
-        if let Err(e) = self.config.save(&crate::config::config_dir()) {
+        if let Err(e) = self.config.save(&self.config_dir) {
             eprintln!("mugon: failed to save config: {e}");
         }
     }
 }
 
 pub type Shared = Mutex<Core>;
+
+/// The level meter's managed state.
+///
+/// It has a name so the lock ordering in this module's docs has something to
+/// refer to: **`Shared` is taken before `Meter`, never the other way round.**
+pub type Meter = Mutex<MeterHandle>;
 
 /// Locks a mutex, recovering from poisoning instead of propagating the panic.
 ///
@@ -287,6 +363,31 @@ where
     }
 }
 
+/// A `Core` backed by a worker-hosted [`crate::audio::fake::FakeMic`], plus the
+/// temporary directory its `persist` writes into.
+///
+/// Lives outside `mod tests` because `lib.rs`'s tests need it too — the hook
+/// dispatch logic is a function of `&mut Core`, and testing it against a real
+/// endpoint is impossible while testing it against no endpoint at all would
+/// only exercise the error paths.
+///
+/// The `TempDir` must be kept alive by the caller: dropping it deletes the
+/// directory out from under any later `persist`.
+#[cfg(test)]
+pub(crate) fn fake_core(mode: Mode) -> (Core, tempfile::TempDir) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let handle = MicHandle::spawn_with(|| Ok(crate::audio::fake::FakeMic::new()))
+        .expect("the fake worker must spawn");
+    let core = Core {
+        machine: ModeMachine::new(Mic::Live(handle), mode),
+        config: Config { mode, ..Config::default() },
+        config_dir: dir.path().to_path_buf(),
+        recorder: Recorder::default(),
+        last_error: None,
+    };
+    (core, dir)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -296,6 +397,7 @@ mod tests {
         Core {
             machine: ModeMachine::new(Mic::Unavailable, Mode::MuteToggle),
             config: Config::default(),
+            config_dir: std::env::temp_dir().join("mugon-test-never-written"),
             recorder: Recorder::default(),
             last_error: None,
         }
@@ -315,7 +417,6 @@ mod tests {
             keys,
             [
                 "autostart",
-                "devices",
                 "hotkey_display",
                 "hotkey_is_bare_printable",
                 "last_error",
@@ -328,6 +429,11 @@ mod tests {
                 "volume",
             ]
         );
+        assert!(
+            !object.contains_key("devices"),
+            "the device list must not ride on the hot snapshot — it costs a full \
+             COM enumeration on every push-to-talk keypress. Use `list_devices`."
+        );
     }
 
     /// A machine with no working audio stack must still produce a renderable
@@ -335,7 +441,6 @@ mod tests {
     #[test]
     fn snapshot_degrades_gracefully_with_no_microphone() {
         let snapshot = unavailable_core().snapshot();
-        assert!(snapshot.devices.is_empty());
         assert!(!snapshot.muted);
         assert_eq!(snapshot.volume, 1.0);
         assert_eq!(snapshot.mode, Mode::MuteToggle);
@@ -401,6 +506,60 @@ mod tests {
         }));
         assert!(shared.is_poisoned(), "sanity: the panic must have poisoned the lock");
         assert_eq!(lock_or_recover(&shared).last_error.as_deref(), Some("set before the panic"));
+    }
+
+    /// Fix 1's property, end to end through the same code path
+    /// `commands::set_device` uses.
+    ///
+    /// `FakeMic::select` cannot model a new endpoint carrying its own mute
+    /// state, so the live state is forced through the machine first; what is
+    /// under test is that `select_device` re-asserts the resting state
+    /// afterwards rather than leaving whatever the new device came with.
+    #[test]
+    fn selecting_a_device_in_ptt_leaves_the_new_device_muted() {
+        let (mut core, _dir) = fake_core(Mode::PushToTalk);
+        assert!(core.machine.mic().is_muted().unwrap(), "PTT rests muted");
+
+        // Simulate the newly selected endpoint arriving live.
+        core.machine.mic_mut().set_muted(false).unwrap();
+
+        core.select_device(Some("device-2".into()));
+
+        assert!(
+            core.machine.mic().is_muted().unwrap(),
+            "a device change in PTT must not leave the new device hot"
+        );
+        assert_eq!(core.config.device_id.as_deref(), Some("device-2"));
+        assert_eq!(core.last_error, None);
+    }
+
+    #[test]
+    fn selecting_a_device_in_mute_toggle_leaves_the_new_device_live() {
+        let (mut core, _dir) = fake_core(Mode::MuteToggle);
+        core.machine.mic_mut().set_muted(true).unwrap();
+
+        core.select_device(None);
+
+        assert!(!core.machine.mic().is_muted().unwrap(), "Mute Toggle rests unmuted");
+        assert_eq!(core.config.device_id, None);
+    }
+
+    /// The user's choice survives a device that is not currently present, so a
+    /// replug restores it rather than silently reverting to the default.
+    #[test]
+    fn a_failed_selection_still_persists_the_users_choice_and_records_why() {
+        let (mut core, dir) = fake_core(Mode::MuteToggle);
+        core.machine = ModeMachine::new(Mic::Unavailable, Mode::MuteToggle);
+
+        core.select_device(Some("unplugged-device".into()));
+
+        assert_eq!(core.config.device_id.as_deref(), Some("unplugged-device"));
+        assert_eq!(core.last_error.as_deref(), Some("no capture device available"));
+        assert_eq!(
+            Config::load(dir.path()).device_id.as_deref(),
+            Some("unplugged-device"),
+            "the choice must survive to the next launch"
+        );
     }
 
     #[test]
