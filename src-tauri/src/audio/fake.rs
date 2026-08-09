@@ -49,3 +49,68 @@ impl MicControl for FakeMic {
     }
     fn peak(&self) -> Result<f32, AudioError> { Ok(self.peak) }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mute_calls_records_every_call_in_order_with_duplicates() {
+        let mut mic = FakeMic::new();
+        mic.set_muted(true).unwrap();
+        mic.set_muted(true).unwrap();
+        mic.set_muted(false).unwrap();
+        assert_eq!(mic.mute_calls, vec![true, true, false]);
+    }
+
+    #[test]
+    fn fail_next_errors_once_then_resets() {
+        let mut mic = FakeMic::new();
+        mic.fail_next = true;
+
+        let result = mic.set_muted(true);
+        assert!(matches!(result, Err(AudioError::NoDevice)));
+        assert!(!mic.fail_next, "fail_next must reset to false after firing");
+
+        // Next call succeeds now that fail_next has reset.
+        assert!(mic.set_muted(true).is_ok());
+    }
+
+    #[test]
+    fn failed_call_is_not_recorded_in_mute_calls() {
+        let mut mic = FakeMic::new();
+        mic.fail_next = true;
+        let _ = mic.set_muted(true);
+        assert!(mic.mute_calls.is_empty());
+    }
+
+    #[test]
+    fn set_volume_clamps_to_unit_range() {
+        let mut mic = FakeMic::new();
+        mic.set_volume(-0.5).unwrap();
+        assert_eq!(mic.volume().unwrap(), 0.0);
+
+        mic.set_volume(1.5).unwrap();
+        assert_eq!(mic.volume().unwrap(), 1.0);
+    }
+
+    #[test]
+    fn select_stores_id_and_none_clears_it() {
+        let mut mic = FakeMic::new();
+        mic.select(Some("device-2")).unwrap();
+        assert_eq!(mic.selected, Some("device-2".to_string()));
+
+        mic.select(None).unwrap();
+        assert_eq!(mic.selected, None);
+    }
+
+    #[test]
+    fn is_muted_reflects_last_successful_set_muted() {
+        let mut mic = FakeMic::new();
+        mic.set_muted(true).unwrap();
+        assert!(mic.is_muted().unwrap());
+
+        mic.set_muted(false).unwrap();
+        assert!(!mic.is_muted().unwrap());
+    }
+}
