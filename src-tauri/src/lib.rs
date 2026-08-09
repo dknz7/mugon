@@ -9,7 +9,8 @@
 //! | `mugon-audio-startup` | nothing after it reports | throwaway; exists only so a wedged audio service becomes a timeout instead of a hang |
 //! | `mugon-hook` | the `WH_KEYBOARD_LL` hook and its message pump | [`hotkey::hook::install`] blocks forever by design |
 //! | `mugon-hook-dispatch` | routing hook events into the recorder or the mode machine | **must not** be the hook thread: a slow Core Audio call there makes Windows silently uninstall the hook |
-//! | `mugon-meter` | the 30Hz `level` poll loop | polls through a `MeterTap`, never touches the `Core` lock |
+//! | `mugon-meter` | the 30Hz `level` poll loop | polls through a `MeterTap`, never touches the `Core` lock; exists only while the settings window does |
+//! | `mugon-emergency-unmute` | a throwaway `Endpoint` | panic-hook only ([`emergency_unmute`]); never touches `Core`, because the panicking thread may be holding it |
 //!
 //! See [`state`]'s module docs for the locking discipline that keeps those
 //! last three from deadlocking against each other.
@@ -79,10 +80,9 @@ pub fn run() {
         last_error.get_or_insert(message);
     }
 
-    let meter_tap = mic.tap();
     let machine = ModeMachine::new(mic, config.mode);
 
-    tauri::Builder::default()
+    let app = tauri::Builder::default()
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_autostart::init(
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
@@ -124,13 +124,15 @@ pub fn run() {
                 .and_then(|core| lock_or_recover(&core).config.hotkey);
             hook::set_binding(binding);
 
-            // Task 10 owns window lifecycle and will move these calls to
-            // window show/hide; starting once here is correct for now. The
-            // `Core` guard above is already released, so `Shared` and [`Meter`]
-            // are never held at the same time here — when Task 10 does hold
-            // both, the order is `Shared` first (see `state`'s module docs).
-            if let (Some(tap), Some(meter)) = (meter_tap, app.try_state::<Meter>()) {
-                lock_or_recover(&meter).start(handle.clone(), tap);
+            // §4.10: metering is a property of the *window*, not of the
+            // process. Tauri has already created the configured window by the
+            // time `setup` runs, so if one exists it gets its stream now;
+            // `tray::show_window` opens one for every window created later.
+            // When Task 12's `--minimized` suppresses the window entirely,
+            // nothing is opened and Windows' microphone-in-use indicator stays
+            // dark — which is the whole point.
+            if app.get_webview_window("main").is_some() {
+                start_metering(&handle);
             }
 
             let (tx, rx) = mpsc::channel::<HookEvent>();
@@ -154,8 +156,138 @@ pub fn run() {
             tray::build(app.handle())?;
             Ok(())
         })
-        .run(tauri::generate_context!())
-        .expect("error while running mugon");
+        .on_window_event(|window, event| {
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                // §4.10: destroy the webview rather than hiding it, so the idle
+                // tray footprint drops to ~10MB and — the part that is visible
+                // to the user — the capture stream is released and Windows'
+                // microphone-in-use indicator goes out. Quit is only reachable
+                // from the tray.
+                api.prevent_close();
+                stop_metering(window.app_handle());
+                let _ = window.destroy();
+            }
+        })
+        .build(tauri::generate_context!())
+        .expect("error while building mugon");
+
+    app.run(|app, event| match event {
+        // Destroying the last window makes Tauri ask to exit. mugon lives in
+        // the tray, so closing the settings panel must not end the process —
+        // `code: None` is exactly the "all windows closed" case, as opposed to
+        // the `Some` that an explicit `AppHandle::exit` carries.
+        tauri::RunEvent::ExitRequested { code: None, api, .. } => api.prevent_exit(),
+        tauri::RunEvent::ExitRequested { .. } => restore_microphone(app),
+        // The catch-all for §4.2's "any mode, any means": this fires for tray
+        // Quit and for `WM_ENDSESSION` (logoff and shutdown) alike, and runs
+        // before Tauri drops the managed state the audio worker lives in.
+        tauri::RunEvent::Exit => restore_microphone(app),
+        _ => {}
+    });
+}
+
+/// Restores the microphone on the way out (§4.2).
+///
+/// Idempotent, and deliberately reachable from every exit path rather than
+/// just the tidy one: leaving a user muted system-wide with no app running to
+/// undo it is the single worst thing mugon can do.
+///
+/// Takes the `Core` lock and nothing else, so it is safe from the main thread
+/// during shutdown. It does **not** emit state or touch the tray — there is
+/// nothing left to render to.
+pub fn restore_microphone(app: &AppHandle) {
+    let Some(core) = app.try_state::<Shared>() else {
+        return;
+    };
+    lock_or_recover(&core).machine.shutdown();
+}
+
+/// How long [`emergency_unmute`] gets before it gives up.
+///
+/// A process that will not die is worse than one that dies with the mic muted,
+/// and this runs inside the panic hook — whatever went wrong may have taken the
+/// audio service with it.
+const EMERGENCY_UNMUTE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Last-resort mic restore for the panic hook.
+///
+/// Deliberately talks to Core Audio through a brand-new endpoint on a
+/// brand-new thread instead of using the running worker or the `Core` lock.
+/// Both of those are suspect at this point: the worker may be the thing that
+/// panicked, and `Core` may be poisoned *or still held* by the panicking
+/// thread, in which case reusing it would turn a crash into a hang.
+///
+/// The fresh thread is also a hard requirement rather than caution.
+/// [`audio::endpoint::Endpoint`] is `!Send` and refuses to construct outside
+/// the MTA, and Tauri's main thread is an STA — so there is no thread already
+/// running that this could legally borrow.
+///
+/// Best-effort by definition: every failure is logged and swallowed, because a
+/// panic inside a panic hook aborts the process immediately.
+pub fn emergency_unmute() {
+    use audio::endpoint::Endpoint;
+    use audio::MicBackend;
+
+    let (tx, rx) = mpsc::channel();
+    let spawned = std::thread::Builder::new()
+        .name("mugon-emergency-unmute".into())
+        .spawn(move || {
+            let _ = tx.send(Endpoint::new().and_then(|mut ep| ep.set_muted(false)));
+        });
+
+    if let Err(e) = spawned {
+        eprintln!("mugon: could not spawn the emergency unmute thread: {e}");
+        return;
+    }
+
+    // The thread is not joined on timeout, for the same reason it is bounded:
+    // it may never come back. Leaving it running costs a stranded thread in a
+    // process that is already dying.
+    match rx.recv_timeout(EMERGENCY_UNMUTE_TIMEOUT) {
+        Ok(Ok(())) => eprintln!("mugon: microphone restored after a panic"),
+        Ok(Err(e)) => eprintln!("mugon: emergency unmute failed: {e}"),
+        Err(_) => eprintln!(
+            "mugon: emergency unmute did not complete within {EMERGENCY_UNMUTE_TIMEOUT:?}; \
+             the microphone may still be muted"
+        ),
+    }
+}
+
+/// Opens the metering capture stream for a settings window that has just been
+/// created (§4.7).
+///
+/// **Lock order: `Core`, then [`Meter`] — never the reverse.** `Core` is taken
+/// only long enough to clone a [`audio::thread::MeterTap`] out of it, and the
+/// guard is dead before the meter lock is taken. That is not tidiness:
+/// `MeterHandle::start` blocks on an audio round trip to open the stream, and
+/// holding `Core` across it would park every command handler and the hook
+/// dispatch thread behind a COM call. See `state`'s module docs.
+pub(crate) fn start_metering(app: &AppHandle) {
+    let Some(core) = app.try_state::<Shared>() else {
+        return;
+    };
+    // A statement of its own so the `Core` guard is a temporary that dies here,
+    // rather than living to the end of the `let` below.
+    let tap = lock_or_recover(&core).machine.mic().tap();
+
+    // `None` means startup found no microphone at all — there is nothing to
+    // meter and nothing to report; `last_error` already says why.
+    let (Some(tap), Some(meter)) = (tap, app.try_state::<Meter>()) else {
+        return;
+    };
+    lock_or_recover(&meter).start(app.clone(), tap);
+}
+
+/// Closes the metering capture stream when the settings window goes away.
+///
+/// Blocks until the poll thread has actually exited, which is what makes the
+/// microphone-in-use indicator go out *before* the window disappears rather
+/// than some time afterwards. Takes only the [`Meter`] lock.
+pub(crate) fn stop_metering(app: &AppHandle) {
+    let Some(meter) = app.try_state::<Meter>() else {
+        return;
+    };
+    lock_or_recover(&meter).stop();
 }
 
 /// What [`dispatch_hook_events`] must do *after* releasing the `Core` lock.

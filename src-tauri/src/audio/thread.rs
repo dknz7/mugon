@@ -275,6 +275,13 @@ impl MeterCapture for super::fake::FakeMic {
 pub struct MicHandle {
     tx: Sender<Command>,
     join: Option<JoinHandle<()>>,
+    /// Nothing is ever sent on this. Its *disconnection* is the signal: the
+    /// matching `Sender` is a parameter of [`run`], so it drops after every
+    /// local in that function — after the capture stream and after the backend
+    /// — meaning a `Disconnected` here proves the worker has finished tearing
+    /// down. [`MicHandle::drop`] waits on it with a bound, which a bare
+    /// `JoinHandle::join` cannot offer.
+    done: Receiver<()>,
 }
 
 /// Task 9 puts `MicHandle` in a Tauri-managed `Mutex` that must be `Send + Sync`
@@ -316,16 +323,17 @@ impl MicHandle {
     {
         let (tx, rx) = mpsc::channel::<Command>();
         let (ready_tx, ready_rx) = mpsc::channel::<Result<(), AudioError>>();
+        let (done_tx, done_rx) = mpsc::channel::<()>();
 
         let join = std::thread::Builder::new()
             .name("mugon-audio".into())
-            .spawn(move || run(make, ready_tx, rx))
+            .spawn(move || run(make, ready_tx, rx, done_tx))
             .map_err(|e| AudioError::Windows(format!("could not spawn audio thread: {e}")))?;
 
         // A `RecvError` here means the worker died without reporting, which is
         // still a startup failure — never an unwrap.
         match ready_rx.recv() {
-            Ok(Ok(())) => Ok(Self { tx, join: Some(join) }),
+            Ok(Ok(())) => Ok(Self { tx, join: Some(join), done: done_rx }),
             Ok(Err(e)) => {
                 let _ = join.join();
                 Err(e)
@@ -472,18 +480,56 @@ impl MicBackend for MicHandle {
 impl Drop for MicHandle {
     /// Asks the worker to stop and waits for it, so the backend (and with it
     /// the COM apartment) is torn down before the handle's owner moves on.
-    /// Both steps ignore failure: the worker may already be gone.
+    /// Every step ignores failure: the worker may already be gone.
+    ///
+    /// **The wait is bounded**, which is the whole reason [`Self::done`]
+    /// exists. `COMMAND_TIMEOUT` bounds how long a *command* may take, not how
+    /// long exit may: a worker wedged inside a COM call never reaches the
+    /// `Shutdown` sitting in its queue, and a plain `join()` would then block
+    /// forever. This drop runs as the process exits, by which point there is no
+    /// window and no tray — so an unbounded join means an invisible process
+    /// that only Task Manager can end.
+    ///
+    /// On timeout the `JoinHandle` is simply dropped, which detaches the
+    /// thread. It keeps its endpoint and its apartment until the process goes,
+    /// which is the correct trade: a leaked thread in a dying process beats a
+    /// process that will not die.
     fn drop(&mut self) {
         let _ = self.tx.send(Command::Shutdown);
-        if let Some(join) = self.join.take() {
-            let _ = join.join();
+
+        // `Ok`/`Disconnected` both mean "finished"; only `Timeout` is failure.
+        let wedged = matches!(
+            self.done.recv_timeout(COMMAND_TIMEOUT),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        );
+
+        match self.join.take() {
+            // The worker is already out of `run`, so this join returns at once.
+            Some(join) if !wedged => {
+                let _ = join.join();
+            }
+            Some(_detached) => eprintln!(
+                "mugon: the audio worker did not shut down within {COMMAND_TIMEOUT:?}; \
+                 detaching it so the process can exit"
+            ),
+            None => {}
         }
     }
 }
 
 /// The worker thread body: construct, report, serve, tear down.
-fn run<B, F>(make: F, ready: Sender<Result<(), AudioError>>, rx: Receiver<Command>)
-where
+///
+/// `_done` is never sent on and is never named again. It is a parameter rather
+/// than a local so that it drops *after* every local below — parameters are
+/// dropped last — which is what makes its disconnection mean "the capture
+/// stream and the backend are already gone" rather than merely "the loop
+/// ended". [`MicHandle::drop`] relies on exactly that.
+fn run<B, F>(
+    make: F,
+    ready: Sender<Result<(), AudioError>>,
+    rx: Receiver<Command>,
+    _done: Sender<()>,
+) where
     B: MicBackend + MeterCapture,
     F: FnOnce() -> Result<B, AudioError>,
 {
@@ -912,6 +958,12 @@ mod tests {
     /// disconnected channel cannot detect: the worker is alive, its channels
     /// are connected, and the reply is simply never coming. Every other fake
     /// in this file either answers or dies.
+    ///
+    /// Both `is_muted` and `peak` block, on the same receiver — one release per
+    /// wedged call. Two entry points because the two tests below need to wedge
+    /// the worker from different sides: one from the owning `MicHandle`, one
+    /// from a `MeterTap` (which has no `is_muted`) so the handle stays free to
+    /// be dropped while the worker is stuck.
     struct WedgedFake {
         release: Receiver<()>,
     }
@@ -938,6 +990,8 @@ mod tests {
             Ok(())
         }
         fn peak(&self) -> Result<f32, AudioError> {
+            // Blocks until the test releases it, or forever if it does not.
+            let _ = self.release.recv();
             Ok(0.0)
         }
     }
@@ -971,6 +1025,47 @@ mod tests {
         // rather than fail it.
         let _ = release_tx.send(());
         drop(mic);
+    }
+
+    /// The exit-side counterpart to the timeout test above, and the property
+    /// the app's quit path depends on: a worker wedged inside a COM call never
+    /// reaches the `Shutdown` in its queue, so `Drop` must give up on it rather
+    /// than join forever. Unbounded, this is a process with no window and no
+    /// tray that only Task Manager can end.
+    ///
+    /// Run on a background thread with a bounded wait for the same reason
+    /// `dropping_the_handle_while_a_tap_is_mid_poll_does_not_hang` is: a
+    /// regression here must fail the suite, not freeze it.
+    #[test]
+    fn dropping_a_handle_whose_worker_is_wedged_detaches_instead_of_hanging() {
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let mic = MicHandle::spawn_with(move || Ok(WedgedFake { release: release_rx }))
+            .expect("must spawn");
+
+        // Wedge the worker through a tap, so the handle itself stays droppable.
+        let tap = mic.tap();
+        std::thread::spawn(move || {
+            let _ = tap.peak();
+        });
+        // Long enough for that `peak` to be in the worker's hands rather than
+        // still in the channel — otherwise `Shutdown` could win the race and
+        // the drop would be testing nothing.
+        std::thread::sleep(Duration::from_millis(250));
+
+        let (done_tx, done_rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let started = std::time::Instant::now();
+            drop(mic);
+            let _ = done_tx.send(started.elapsed());
+        });
+
+        let elapsed = done_rx
+            .recv_timeout(COMMAND_TIMEOUT * 3)
+            .expect("MicHandle::drop hung on a wedged worker — the join is unbounded again");
+        assert!(elapsed >= COMMAND_TIMEOUT, "drop gave up before the bound: {elapsed:?}");
+
+        // Let the detached worker finish so it does not outlive the test run.
+        let _ = release_tx.send(());
     }
 
     #[test]

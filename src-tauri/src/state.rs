@@ -8,12 +8,13 @@
 //! every one of them is load-bearing.
 //!
 //! **1. Lock order is `Core` before [`Meter`]. Never the reverse.**
-//! Today nothing holds both at once — `lib.rs`'s `setup` releases the `Core`
-//! guard before taking the meter's. That will not survive Task 10, which wires
-//! `MeterHandle::start`/`stop` to window show/hide: getting the [`MeterTap`] to
-//! start with requires `Core`, so that code *will* hold both. When it does, it
-//! must take them in this order, because there is no ordering to discover from
-//! the code once two call sites disagree.
+//! The one place that touches both is `lib.rs`'s `start_metering`, which the
+//! window lifecycle calls on every window create: getting the [`MeterTap`] to
+//! start with requires `Core`. It takes `Core` first, clones the tap out, and
+//! lets that guard die *before* taking the meter lock — so in practice the two
+//! are never held simultaneously either. Any future call site must take them in
+//! this order, because there is no ordering to discover from the code once two
+//! of them disagree.
 //!
 //! **2. The audio worker never takes the `Core` lock.** It owns a `!Send` Core
 //! Audio endpoint and services commands over a channel
@@ -33,11 +34,12 @@
 //! an inner block and call it after; the hook dispatch loop returns a
 //! description of its follow-up work instead of doing it inline.
 //!
-//! One extra caution for Task 10: `MeterHandle::start` blocks on an audio
-//! round-trip (it opens the capture stream) and `stop` joins the poll thread.
-//! Doing either on the UI thread while holding `Core` compounds every other
-//! cost on this list — prefer releasing `Core` first, which is possible because
-//! a [`MeterTap`] is cloneable and can be taken out of the guard.
+//! One extra caution, and the reason rule 1 is written the way it is:
+//! `MeterHandle::start` blocks on an audio round-trip (it opens the capture
+//! stream) and `stop` joins the poll thread. Both run on the UI thread from the
+//! window handlers, and doing either while holding `Core` would compound every
+//! other cost on this list — hence releasing `Core` first, which is possible
+//! only because a [`MeterTap`] is cloneable and can be taken out of the guard.
 
 use std::path::PathBuf;
 use std::sync::mpsc;
