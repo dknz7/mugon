@@ -15,6 +15,14 @@ pub enum AudioError {
     NoDevice,
     #[error("device {0} not found")]
     DeviceNotFound(String),
+    /// The audio worker thread ([`thread::MicHandle`]'s) is gone: it panicked,
+    /// exited, or never started. Distinct from [`AudioError::Windows`] because
+    /// the recovery policy differs — a failed COM call is transient and the
+    /// next call may well succeed, whereas a dead worker means *every*
+    /// subsequent call will fail until the app restarts. Task 9 surfaces this
+    /// through `AppState.last_error` and deliberately does not respawn.
+    #[error("audio thread terminated")]
+    ThreadTerminated,
     #[error("windows audio error: {0}")]
     Windows(String),
 }

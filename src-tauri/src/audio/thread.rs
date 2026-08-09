@@ -33,8 +33,12 @@ use super::{AudioError, DeviceInfo, MicBackend};
 /// The one error every "the worker is gone" path produces. Callers include
 /// Tauri command handlers and the keyboard-hook dispatch thread, so a dead
 /// worker must degrade to this rather than panicking either of them.
+///
+/// A dedicated variant rather than a [`AudioError::Windows`] string, so those
+/// callers can branch on "the audio thread is dead" without matching on an
+/// error message — see [`AudioError::ThreadTerminated`].
 fn worker_gone() -> AudioError {
-    AudioError::Windows("audio thread terminated".into())
+    AudioError::ThreadTerminated
 }
 
 /// One variant per [`MicBackend`] method, each carrying the reply channel for
@@ -786,9 +790,7 @@ mod tests {
 
         fn expect_dead<T: std::fmt::Debug>(result: Result<T, AudioError>) {
             match result {
-                Err(AudioError::Windows(msg)) => {
-                    assert!(msg.contains("audio thread terminated"), "got {msg}");
-                }
+                Err(AudioError::ThreadTerminated) => {}
                 other => panic!("expected a dead-worker error, got {other:?}"),
             }
         }
@@ -863,12 +865,10 @@ mod tests {
         assert!(!mic.is_muted().unwrap(), "worker must be serving before the kill");
 
         let result = with_quiet_panics(|| mic.set_muted(true));
-        match result {
-            Err(AudioError::Windows(msg)) => {
-                assert!(msg.contains("audio thread terminated"), "got {msg}");
-            }
-            other => panic!("expected a dead-worker error, got {other:?}"),
-        }
+        assert!(
+            matches!(result, Err(AudioError::ThreadTerminated)),
+            "expected a dead-worker error, got {result:?}"
+        );
 
         // And the handle stays usable-as-broken rather than poisoned.
         assert!(mic.is_muted().is_err(), "later calls must keep erroring");
@@ -882,9 +882,7 @@ mod tests {
             })
         });
         match result {
-            Err(AudioError::Windows(msg)) => {
-                assert!(msg.contains("audio thread terminated"), "got {msg}");
-            }
+            Err(AudioError::ThreadTerminated) => {}
             Err(other) => panic!("expected a dead-worker error, got {other:?}"),
             Ok(_) => panic!("spawn must not hand back a handle to a dead worker"),
         }
@@ -1041,9 +1039,7 @@ mod tests {
         drop(mic);
 
         match tap.peak() {
-            Err(AudioError::Windows(msg)) => {
-                assert!(msg.contains("audio thread terminated"), "got {msg}");
-            }
+            Err(AudioError::ThreadTerminated) => {}
             other => panic!("expected a dead-worker error, got {other:?}"),
         }
     }
