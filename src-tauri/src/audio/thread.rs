@@ -96,6 +96,13 @@ impl Drop for ComApartment {
 /// endpoint releases its COM interfaces *before* `_apartment` calls
 /// `CoUninitialize`. Reversing these would tear down COM underneath live
 /// interface pointers.
+///
+/// Be aware that the invariant is currently **inert**: `Endpoint::new` takes a
+/// second, unreleased COM reference of its own (see the `CoInitializeEx` call in
+/// `endpoint.rs`), so this thread's count never actually reaches zero and
+/// `ComApartment::drop` tears nothing down. Swapping these two fields today
+/// would not crash — it would crash the moment somebody fixes that imbalance.
+/// Which is exactly why the order is written down rather than discovered later.
 struct MtaEndpoint {
     endpoint: Endpoint,
     _apartment: ComApartment,
@@ -147,9 +154,15 @@ pub struct MicHandle {
 /// Task 9 puts `MicHandle` in a Tauri-managed `Mutex` that must be `Send + Sync`
 /// (`Mutex<T>: Sync` needs `T: Send`). Assert it here so a future field that is
 /// not `Send` fails at this line rather than three tasks later.
+///
+/// The second assertion is the other half: `MicControl` is `MicBackend + Send`,
+/// so it is reached through the blanket impl and only while `MicHandle` stays
+/// `Send`. Losing `Send` fails both lines.
 const _: fn() = || {
     fn assert_send<T: Send>() {}
+    fn assert_mic_control<T: super::MicControl>() {}
     assert_send::<MicHandle>();
+    assert_mic_control::<MicHandle>();
 };
 
 impl MicHandle {
@@ -207,7 +220,11 @@ impl MicHandle {
     }
 }
 
-impl super::MicControl for MicHandle {
+/// `MicHandle` implements the backend trait like everything else; because it is
+/// `Send` (holding nothing but channel endpoints), the blanket impl in the
+/// parent module hands it [`super::MicControl`] for free. It is the only type in
+/// the tree that is both.
+impl MicBackend for MicHandle {
     fn list_devices(&self) -> Result<Vec<DeviceInfo>, AudioError> {
         self.call(Command::ListDevices)
     }
@@ -301,7 +318,6 @@ where
 mod tests {
     use super::*;
     use crate::audio::fake::FakeMic;
-    use crate::audio::MicControl;
     use std::sync::{Arc, Mutex};
 
     /// Test-only introspection seam.
@@ -333,29 +349,27 @@ mod tests {
         }
     }
 
-    // Delegates through UFCS: `FakeMic` implements both `MicControl` and
-    // `MicBackend`, and both are in scope here.
     impl MicBackend for SharedFake {
         fn list_devices(&self) -> Result<Vec<DeviceInfo>, AudioError> {
-            self.with(|m| MicControl::list_devices(m))?
+            self.with(|m| m.list_devices())?
         }
         fn select(&mut self, id: Option<&str>) -> Result<(), AudioError> {
-            self.with(|m| MicControl::select(m, id))?
+            self.with(|m| m.select(id))?
         }
         fn is_muted(&self) -> Result<bool, AudioError> {
-            self.with(|m| MicControl::is_muted(m))?
+            self.with(|m| m.is_muted())?
         }
         fn set_muted(&mut self, muted: bool) -> Result<(), AudioError> {
-            self.with(|m| MicControl::set_muted(m, muted))?
+            self.with(|m| m.set_muted(muted))?
         }
         fn volume(&self) -> Result<f32, AudioError> {
-            self.with(|m| MicControl::volume(m))?
+            self.with(|m| m.volume())?
         }
         fn set_volume(&mut self, level: f32) -> Result<(), AudioError> {
-            self.with(|m| MicControl::set_volume(m, level))?
+            self.with(|m| m.set_volume(level))?
         }
         fn peak(&self) -> Result<f32, AudioError> {
-            self.with(|m| MicControl::peak(m))?
+            self.with(|m| m.peak())?
         }
     }
 
@@ -377,6 +391,18 @@ mod tests {
         assert!(!mic.is_muted().unwrap());
     }
 
+    /// Ordering is guaranteed **structurally**, not by this test: every call
+    /// blocks on its own reply before returning, and `set_muted` takes
+    /// `&mut self`, so a second command cannot even be issued until the first
+    /// has been serviced. There is no implementation of the current shape that
+    /// could fail this assertion.
+    ///
+    /// It is here as a regression tripwire for the *shape*, and it has a known
+    /// blind spot: a future fire-and-forget path (a `SetMuted` that does not
+    /// wait for a reply) or a `Clone` impl on `MicHandle` letting two threads
+    /// interleave sends would both keep this test green while the guarantee
+    /// Task 6's push-to-talk depends on quietly evaporates. Either change needs
+    /// a new test that actually races.
     #[test]
     fn commands_reach_the_backend_in_the_order_they_were_issued() {
         let (mut mic, view) = spawn_fake();
@@ -403,12 +429,19 @@ mod tests {
         assert!(mic.is_muted().unwrap());
     }
 
+    /// Covers the **send** side of worker death, on all seven methods: the
+    /// worker is already gone when the call starts, so `tx.send` fails and
+    /// `call` returns before it ever reaches `reply_rx.recv()`.
+    ///
+    /// The receive side — worker dies *mid-command* — is a different branch and
+    /// is covered by `a_worker_that_dies_mid_command_..` below. Do not assume
+    /// this test exercises it; it cannot.
     #[test]
     fn a_dead_worker_degrades_to_an_error_on_every_path() {
         let (mut mic, _view) = spawn_fake();
 
         // Stop the worker out from under the handle and wait for it, so the
-        // send-side and receive-side failures are both deterministic.
+        // send failure is deterministic rather than racing the worker's exit.
         mic.tx.send(Command::Shutdown).expect("worker still alive");
         mic.join.take().expect("handle owns the thread").join().expect("worker panicked");
 
@@ -428,6 +461,89 @@ mod tests {
         expect_dead(mic.select(Some("anything")));
         expect_dead(mic.set_muted(true));
         expect_dead(mic.set_volume(0.5));
+    }
+
+    /// A backend that blows up inside a call, to kill the worker *mid-command*.
+    ///
+    /// This is the only way to reach `call`'s `reply_rx.recv()` failure branch:
+    /// the send succeeds, the worker unwinds, the reply `Sender` drops, and the
+    /// caller must get an `Err` rather than blocking on a reply that will never
+    /// come. That branch is the difference between a crashed caller and a
+    /// *hung* one, so it gets a test rather than an argument.
+    struct PanickingFake;
+
+    impl MicBackend for PanickingFake {
+        fn list_devices(&self) -> Result<Vec<DeviceInfo>, AudioError> {
+            Ok(Vec::new())
+        }
+        fn select(&mut self, _id: Option<&str>) -> Result<(), AudioError> {
+            Ok(())
+        }
+        fn is_muted(&self) -> Result<bool, AudioError> {
+            Ok(false)
+        }
+        fn set_muted(&mut self, _muted: bool) -> Result<(), AudioError> {
+            panic!("backend exploded")
+        }
+        fn volume(&self) -> Result<f32, AudioError> {
+            Ok(0.0)
+        }
+        fn set_volume(&mut self, _level: f32) -> Result<(), AudioError> {
+            Ok(())
+        }
+        fn peak(&self) -> Result<f32, AudioError> {
+            Ok(0.0)
+        }
+    }
+
+    /// The panic hook is process-global, so the two tests that deliberately
+    /// panic a worker serialise on this and put the previous hook back.
+    /// Suppressing it keeps a real backtrace out of otherwise-clean output.
+    static PANIC_HOOK: Mutex<()> = Mutex::new(());
+
+    fn with_quiet_panics<T>(f: impl FnOnce() -> T) -> T {
+        let _guard = PANIC_HOOK.lock().unwrap_or_else(|e| e.into_inner());
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let out = f();
+        std::panic::set_hook(previous);
+        out
+    }
+
+    #[test]
+    fn a_worker_that_dies_mid_command_errors_the_caller_instead_of_hanging_it() {
+        let mut mic = MicHandle::spawn_with(|| Ok(PanickingFake)).expect("must spawn");
+
+        // Prove the worker is alive first, so the send below certainly succeeds
+        // and the failure we observe can only be on the reply side.
+        assert!(!mic.is_muted().unwrap(), "worker must be serving before the kill");
+
+        let result = with_quiet_panics(|| mic.set_muted(true));
+        match result {
+            Err(AudioError::Windows(msg)) => {
+                assert!(msg.contains("audio thread terminated"), "got {msg}");
+            }
+            other => panic!("expected a dead-worker error, got {other:?}"),
+        }
+
+        // And the handle stays usable-as-broken rather than poisoned.
+        assert!(mic.is_muted().is_err(), "later calls must keep erroring");
+    }
+
+    #[test]
+    fn spawn_reports_a_worker_that_panicked_during_construction() {
+        let result = with_quiet_panics(|| {
+            MicHandle::spawn_with(|| -> Result<PanickingFake, AudioError> {
+                panic!("factory exploded")
+            })
+        });
+        match result {
+            Err(AudioError::Windows(msg)) => {
+                assert!(msg.contains("audio thread terminated"), "got {msg}");
+            }
+            Err(other) => panic!("expected a dead-worker error, got {other:?}"),
+            Ok(_) => panic!("spawn must not hand back a handle to a dead worker"),
+        }
     }
 
     #[test]
@@ -467,6 +583,23 @@ mod tests {
     fn spawn_reports_backend_construction_failure_synchronously() {
         let result = MicHandle::spawn_with(|| Err::<SharedFake, _>(AudioError::NoDevice));
         assert!(matches!(result, Err(AudioError::NoDevice)));
+    }
+
+    /// The same `MicControl`-generic shape Task 6 will use, resolved for the
+    /// real proxy rather than the fake. `MicHandle` never names `MicControl` in
+    /// an impl — it gets it from the blanket impl because it is a `Send`
+    /// `MicBackend` — so this is the runtime proof that the collapse holds.
+    #[test]
+    fn a_mic_control_generic_resolves_for_the_handle() {
+        fn toggle<M: crate::audio::MicControl>(mic: &mut M) -> Result<bool, AudioError> {
+            let before = mic.is_muted()?;
+            mic.set_muted(!before)?;
+            mic.is_muted()
+        }
+
+        let (mut mic, view) = spawn_fake();
+        assert!(toggle(&mut mic).unwrap());
+        assert_eq!(view.lock().unwrap().mute_calls, vec![true]);
     }
 
     /// The proxy is only useful if it can actually be moved to another thread —

@@ -27,15 +27,20 @@ pub struct DeviceInfo {
 
 /// The only interface `modes.rs` is allowed to depend on, so the mode state
 /// machine can be tested against `fake::FakeMic` without Core Audio (§3).
-pub trait MicControl: Send {
-    fn list_devices(&self) -> Result<Vec<DeviceInfo>, AudioError>;
-    fn select(&mut self, id: Option<&str>) -> Result<(), AudioError>;
-    fn is_muted(&self) -> Result<bool, AudioError>;
-    fn set_muted(&mut self, muted: bool) -> Result<(), AudioError>;
-    fn volume(&self) -> Result<f32, AudioError>;
-    fn set_volume(&mut self, level: f32) -> Result<(), AudioError>;
-    fn peak(&self) -> Result<f32, AudioError>;
-}
+///
+/// `MicControl` is [`MicBackend`] **plus the promise that the implementor can
+/// cross a thread boundary**, and nothing else — it declares no methods of its
+/// own. The blanket impl below means every `Send` backend is automatically a
+/// `MicControl`, so each backend writes its seven method bodies exactly once and
+/// there is no forwarding boilerplate anywhere in the tree.
+///
+/// The invariant this whole layer exists to enforce falls straight out of the
+/// bound: `Endpoint` is a `MicBackend` but is not `Send`, so it can never be a
+/// `MicControl`, and the only way to reach one from a `MicControl` caller is
+/// through [`thread::MicHandle`]. See the `compile_fail` doctest on `Endpoint`.
+pub trait MicControl: MicBackend + Send {}
+
+impl<T: MicBackend + Send + ?Sized> MicControl for T {}
 
 /// What the audio worker thread drives. Deliberately **not** `Send`:
 /// implementors may be apartment-bound COM objects that are only ever legal to
@@ -69,6 +74,25 @@ pub fn peak_to_dbfs(peak: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Stands in for the shape Task 6's `modes.rs` will have: a function generic
+    /// over `MicControl` calling backend methods through the supertrait.
+    /// `modes.rs` holds only the `Mode` enum today, so nothing in the tree
+    /// carries that bound yet — this makes sure the bound *works* before Task 6
+    /// depends on it, and would stop compiling if the blanket impl ever stopped
+    /// reaching a plain `Send` backend.
+    fn toggle_through_mic_control<M: MicControl>(mic: &mut M) -> Result<bool, AudioError> {
+        let before = mic.is_muted()?;
+        mic.set_muted(!before)?;
+        mic.is_muted()
+    }
+
+    #[test]
+    fn a_mic_control_generic_resolves_for_a_send_backend() {
+        let mut mic = crate::audio::fake::FakeMic::new();
+        assert!(toggle_through_mic_control(&mut mic).unwrap());
+        assert_eq!(mic.mute_calls, vec![true], "the call reached the backend");
+    }
 
     #[test]
     fn silence_maps_to_floor() {

@@ -18,13 +18,14 @@
 //! what lock guards it, so no `unsafe impl Send` can rescue this — the objects
 //! have to live on a thread we control.
 //!
-//! Consequently `Endpoint` does **not** implement [`super::MicControl`], which
-//! requires `Send`. The methods below deliberately mirror that trait's
-//! signatures exactly; a `Send` proxy owning a dedicated MTA thread implements
-//! `MicControl` by forwarding to them. Do not change these signatures without
-//! changing the proxy.
+//! Consequently `Endpoint` implements [`super::MicBackend`] — the non-`Send`
+//! half of the pair — and can **never** implement [`super::MicControl`], which
+//! is `MicBackend + Send`. That is not a convention anyone has to remember: it
+//! is enforced by the compiler, and pinned by a `compile_fail` doctest below.
+//! [`super::thread::MicHandle`] is the only legitimate way to drive these
+//! methods from a `Send` context.
 
-use super::{AudioError, DeviceInfo};
+use super::{AudioError, DeviceInfo, MicBackend};
 use windows::core::PCWSTR;
 use windows::Win32::Devices::FunctionDiscovery::PKEY_Device_FriendlyName;
 use windows::Win32::Media::Audio::Endpoints::{IAudioEndpointVolume, IAudioMeterInformation};
@@ -42,6 +43,27 @@ fn win<T>(r: windows::core::Result<T>) -> Result<T, AudioError> {
     r.map_err(|e| AudioError::Windows(e.to_string()))
 }
 
+/// A Core Audio capture endpoint, bound for life to the thread that built it.
+///
+/// The invariant the whole confinement design rests on: an `Endpoint` is a
+/// `MicBackend`, but it is **not** `Send`, so it can never satisfy
+/// `MicControl`. Anything that wants a `MicControl` must go through
+/// [`super::thread::MicHandle`].
+///
+/// The bound resolves for the `Send` proxy:
+///
+/// ```
+/// fn requires_mic_control<T: mugon_lib::audio::MicControl>() {}
+/// requires_mic_control::<mugon_lib::audio::thread::MicHandle>();
+/// ```
+///
+/// and is rejected for the apartment-bound endpoint. If this ever starts
+/// compiling, something has made `Endpoint` `Send` and the confinement is gone:
+///
+/// ```compile_fail
+/// fn requires_mic_control<T: mugon_lib::audio::MicControl>() {}
+/// requires_mic_control::<mugon_lib::audio::endpoint::Endpoint>();
+/// ```
 pub struct Endpoint {
     enumerator: IMMDeviceEnumerator,
     /// `None` means "follow the system default" (§4.5).
@@ -156,12 +178,16 @@ impl Endpoint {
             Ok(())
         }
     }
+}
 
-    // The methods below mirror `super::MicControl` signature-for-signature.
-    // `Endpoint` cannot implement that trait (it requires `Send`), so the proxy
-    // implements it by forwarding here. Keep these in lockstep with the trait.
-
-    pub fn list_devices(&self) -> Result<Vec<DeviceInfo>, AudioError> {
+/// The seven backend operations. `Endpoint` implements [`MicBackend`], the
+/// non-`Send` half of the pair, and **cannot** implement [`super::MicControl`]:
+/// that is `MicBackend + Send`, and these COM interfaces are apartment-bound.
+/// The `compile_fail` doctest on the struct above pins that down.
+///
+/// Reaching these from a `Send` context is [`super::thread::MicHandle`]'s job.
+impl MicBackend for Endpoint {
+    fn list_devices(&self) -> Result<Vec<DeviceInfo>, AudioError> {
         unsafe {
             let default_id = self
                 .enumerator
@@ -192,7 +218,7 @@ impl Endpoint {
     /// `device`/`volume`/`meter` still point at the old one. Without this, every
     /// later `refresh` (including the future hotplug callback) would re-attempt
     /// the bad id and silently pin the app to the stale endpoint.
-    pub fn select(&mut self, id: Option<&str>) -> Result<(), AudioError> {
+    fn select(&mut self, id: Option<&str>) -> Result<(), AudioError> {
         let previous = self.selected_id.take();
         self.selected_id = id.map(str::to_owned);
         match self.refresh() {
@@ -204,56 +230,27 @@ impl Endpoint {
         }
     }
 
-    pub fn is_muted(&self) -> Result<bool, AudioError> {
+    fn is_muted(&self) -> Result<bool, AudioError> {
         unsafe { Ok(win(self.volume.GetMute())?.as_bool()) }
     }
 
-    pub fn set_muted(&mut self, muted: bool) -> Result<(), AudioError> {
+    fn set_muted(&mut self, muted: bool) -> Result<(), AudioError> {
         unsafe { win(self.volume.SetMute(muted, std::ptr::null())) }
     }
 
-    pub fn volume(&self) -> Result<f32, AudioError> {
+    fn volume(&self) -> Result<f32, AudioError> {
         unsafe { win(self.volume.GetMasterVolumeLevelScalar()) }
     }
 
-    pub fn set_volume(&mut self, level: f32) -> Result<(), AudioError> {
+    fn set_volume(&mut self, level: f32) -> Result<(), AudioError> {
         unsafe {
             win(self.volume
                 .SetMasterVolumeLevelScalar(level.clamp(0.0, 1.0), std::ptr::null()))
         }
     }
 
-    pub fn peak(&self) -> Result<f32, AudioError> {
-        unsafe { win(self.meter.GetPeakValue()) }
-    }
-}
-
-/// Pure delegation to the inherent methods above. `MicBackend` is the non-`Send`
-/// trait the confined worker thread drives; see [`super::MicBackend`].
-///
-/// Each body names the inherent method by path rather than calling through
-/// `self`, so this impl can never accidentally recurse into itself.
-impl super::MicBackend for Endpoint {
-    fn list_devices(&self) -> Result<Vec<DeviceInfo>, AudioError> {
-        Endpoint::list_devices(self)
-    }
-    fn select(&mut self, id: Option<&str>) -> Result<(), AudioError> {
-        Endpoint::select(self, id)
-    }
-    fn is_muted(&self) -> Result<bool, AudioError> {
-        Endpoint::is_muted(self)
-    }
-    fn set_muted(&mut self, muted: bool) -> Result<(), AudioError> {
-        Endpoint::set_muted(self, muted)
-    }
-    fn volume(&self) -> Result<f32, AudioError> {
-        Endpoint::volume(self)
-    }
-    fn set_volume(&mut self, level: f32) -> Result<(), AudioError> {
-        Endpoint::set_volume(self, level)
-    }
     fn peak(&self) -> Result<f32, AudioError> {
-        Endpoint::peak(self)
+        unsafe { win(self.meter.GetPeakValue()) }
     }
 }
 
