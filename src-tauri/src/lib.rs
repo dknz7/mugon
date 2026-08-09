@@ -1,3 +1,4 @@
+pub mod audio;
 pub mod hotkey;
 pub mod modes;
 pub mod config;
