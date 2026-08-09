@@ -125,14 +125,17 @@ pub fn run() {
             hook::set_binding(binding);
 
             // §4.10: metering is a property of the *window*, not of the
-            // process. Tauri has already created the configured window by the
-            // time `setup` runs, so if one exists it gets its stream now;
-            // `tray::show_window` opens one for every window created later.
-            // When Task 12's `--minimized` suppresses the window entirely,
-            // nothing is opened and Windows' microphone-in-use indicator stays
-            // dark — which is the whole point.
-            if app.get_webview_window("main").is_some() {
-                start_metering(&handle);
+            // process. `tauri.conf.json` declares no window
+            // (`"windows": []`), so nothing exists yet — `tray::show_window`
+            // is the single window-creation path (the same one every later
+            // "show settings" click uses) and starts metering itself once the
+            // window it just built exists. Task 12: when launched with
+            // `--minimized` (the autostart argument registered below), skip
+            // this entirely — no window is opened and Windows'
+            // microphone-in-use indicator stays dark, which is the whole
+            // point.
+            if !std::env::args().any(|arg| arg == "--minimized") {
+                tray::show_window(&handle);
             }
 
             let (tx, rx) = mpsc::channel::<HookEvent>();

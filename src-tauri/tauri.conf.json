@@ -11,17 +11,7 @@
   },
   "app": {
     "withGlobalTauri": true,
-    "windows": [
-      {
-        "title": "mugon",
-        "width": 460,
-        "height": 700,
-        "resizable": false,
-        "maximizable": false,
-        "visible": true,
-        "decorations": true
-      }
-    ],
+    "windows": [],
     "security": { "csp": "default-src 'self'; style-src 'self' 'unsafe-inline'" }
   },
   "bundle": {
