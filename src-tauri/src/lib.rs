@@ -232,7 +232,30 @@ pub fn emergency_unmute() {
     let spawned = std::thread::Builder::new()
         .name("mugon-emergency-unmute".into())
         .spawn(move || {
-            let _ = tx.send(Endpoint::new().and_then(|mut ep| ep.set_muted(false)));
+            let result = Endpoint::new().and_then(|mut ep| {
+                // Re-point at the *saved* device before unmuting. A fresh
+                // `Endpoint` always opens the system default
+                // (`GetDefaultAudioEndpoint`), and on any machine with virtual
+                // audio devices that is routinely not the physical microphone
+                // the user configured — so unmuting it would restore the wrong
+                // endpoint and leave the muted one exactly as dead as before.
+                //
+                // Reading the config here does not break this function's one
+                // rule. `Config::load` is a filesystem read that cannot fail
+                // (it falls back to defaults), touches no lock and no `Core`,
+                // and rides inside the same [`EMERGENCY_UNMUTE_TIMEOUT`] as
+                // everything else here.
+                //
+                // A failed `select` is logged and ignored on purpose: unmuting
+                // whichever endpoint we do have beats giving up entirely.
+                if let Some(id) = Config::load(&config::config_dir()).device_id.as_deref() {
+                    if let Err(e) = ep.select(Some(id)) {
+                        eprintln!("mugon: emergency unmute could not select {id}: {e}");
+                    }
+                }
+                ep.set_muted(false)
+            });
+            let _ = tx.send(result);
         });
 
     if let Err(e) = spawned {

@@ -97,7 +97,7 @@ pub fn build(app: &AppHandle) -> tauri::Result<()> {
             "toggle" => {
                 // No-ops in Push to Talk, where the item is disabled anyway
                 // (§4.1) — `ModeMachine::toggle_manual` enforces it regardless.
-                if let Some(muted) = with_core(app, |c| c.machine.toggle_manual()) {
+                if let Some(muted) = with_core(app, |c| c.toggle_mute()) {
                     update_icon(app, muted);
                 }
                 emit_state(app);
@@ -122,31 +122,24 @@ pub fn build(app: &AppHandle) -> tauri::Result<()> {
     Ok(())
 }
 
-/// Applies `change` under the `Core` lock and reports the mute state it left
-/// behind, or `None` if there is no managed state to change.
+/// Runs `change` under the `Core` lock and hands back its result, or `None` if
+/// there is no managed state to change.
 ///
-/// The mute read is the same probe [`Core::refresh_mic_health`] makes — success
-/// clears `last_error`, failure records why — kept as a value here because the
-/// tray needs it to pick an icon, and asking the worker a second time after the
-/// lock is released would be a second COM round trip for an answer we just had.
-///
-/// The guard is scoped to this function so callers cannot accidentally hold it
-/// across [`emit_state`] or [`update_icon`], both of which re-enter the lock.
-fn with_core(app: &AppHandle, change: impl FnOnce(&mut Core)) -> Option<bool> {
+/// Exists so the guard is scoped to this function and callers cannot
+/// accidentally hold it across [`emit_state`] or [`update_icon`], both of which
+/// re-enter the lock or marshal onto the main thread.
+fn with_core<T>(app: &AppHandle, change: impl FnOnce(&mut Core) -> T) -> Option<T> {
     let core = app.try_state::<Shared>()?;
     let mut c = lock_or_recover(&core);
-    change(&mut c);
-    let muted = c.machine.mic().is_muted();
-    c.record_outcome(&muted);
-    Some(muted.unwrap_or(false))
+    Some(change(&mut c))
 }
 
 fn set_mode(app: &AppHandle, mode: Mode) {
-    let muted = with_core(app, |c| {
-        c.machine.set_mode(mode);
-        c.config.mode = mode;
-        c.persist();
-    });
+    // Shared with `commands::set_mode` — see [`Core::apply_mode`]. The two
+    // differ only in the follow-up: the tray additionally has check marks to
+    // move, which is exactly the kind of difference that used to justify a
+    // second copy of the mode-change logic and would have let it drift.
+    let muted = with_core(app, |c| c.apply_mode(mode));
     sync_menu(app, mode);
     if let Some(muted) = muted {
         update_icon(app, muted);

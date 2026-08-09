@@ -48,13 +48,18 @@ pub fn set_device(app: AppHandle, core: State<Shared>, id: Option<String>) {
 
 #[tauri::command]
 pub fn set_mode(app: AppHandle, core: State<Shared>, mode: Mode) {
-    {
-        let mut c = lock_or_recover(&core);
-        c.machine.set_mode(mode);
-        c.refresh_mic_health();
-        c.config.mode = mode;
-        c.persist();
-    }
+    // Shared with the tray's Mode submenu — see `Core::apply_mode`.
+    //
+    // The guard is a temporary of this statement, so it is dead before the
+    // three calls below, every one of which either re-enters the lock or
+    // marshals onto the main thread.
+    let muted = lock_or_recover(&core).apply_mode(mode);
+    // The tray is the app's permanent surface and has no other way to learn
+    // that the settings window changed the mode: without these, a mode change
+    // from the UI leaves the tray showing the old check mark, the old icon, and
+    // a Toggle Mute item enabled in a mode where it does nothing.
+    crate::tray::sync_menu(&app, mode);
+    crate::tray::update_icon(&app, muted);
     emit_state(&app);
 }
 
@@ -71,11 +76,9 @@ pub fn set_volume(app: AppHandle, core: State<Shared>, level: f32) {
 
 #[tauri::command]
 pub fn toggle_mute(app: AppHandle, core: State<Shared>) {
-    {
-        let mut c = lock_or_recover(&core);
-        c.machine.toggle_manual();
-        c.refresh_mic_health();
-    }
+    // Shared with the tray's Toggle Mute item — see `Core::toggle_mute`.
+    let muted = lock_or_recover(&core).toggle_mute();
+    crate::tray::update_icon(&app, muted);
     emit_state(&app);
 }
 

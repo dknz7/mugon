@@ -236,17 +236,50 @@ impl Core {
         };
     }
 
-    /// Re-reads mute state purely to find out whether the endpoint is still
-    /// answering.
+    /// Re-reads mute state to find out whether the endpoint is still
+    /// answering, and hands the answer back.
     ///
     /// [`ModeMachine`] swallows device errors by design (DESIGN.md §7 — a
     /// failed Core Audio call must never panic the state machine), so a mute
     /// change that silently failed would otherwise leave the user with no
     /// signal whatsoever. This is the cheapest honest probe: if the worker is
     /// dead or the endpoint is broken, this read fails too.
-    pub fn refresh_mic_health(&mut self) {
+    ///
+    /// The returned `bool` is the same "unreadable counts as unmuted" default
+    /// [`Self::snapshot`] uses. It exists so callers that need the new mute
+    /// state — the tray, to pick an icon — do not have to ask the worker a
+    /// second time for an answer this call already had.
+    pub fn refresh_mic_health(&mut self) -> bool {
         let result = self.machine.mic().is_muted();
         self.record_outcome(&result);
+        result.unwrap_or(false)
+    }
+
+    /// Switches mode, persists the choice, and reports the mute state it left
+    /// behind.
+    ///
+    /// The whole of `commands::set_mode` minus the Tauri plumbing, and the
+    /// whole of the tray's Mode submenu minus its menu bookkeeping — which is
+    /// the point. Both call sites need the same three things done in the same
+    /// order (`ModeMachine::set_mode`, which re-asserts the resting state;
+    /// record the choice; persist it) and differ only in what they do
+    /// *afterwards*. Two copies of that would drift.
+    pub fn apply_mode(&mut self, mode: Mode) -> bool {
+        self.machine.set_mode(mode);
+        self.config.mode = mode;
+        self.persist();
+        self.refresh_mic_health()
+    }
+
+    /// The manual mute switch (§4.1), reporting the mute state it left behind.
+    /// A no-op in Push to Talk — [`ModeMachine::toggle_manual`] enforces that,
+    /// not this.
+    ///
+    /// Same rationale as [`Self::apply_mode`]: the IPC command and the tray
+    /// menu item are the same operation with different follow-ups.
+    pub fn toggle_mute(&mut self) -> bool {
+        self.machine.toggle_manual();
+        self.refresh_mic_health()
     }
 
     /// Re-points the microphone at `id` and re-asserts the mode's resting
@@ -562,6 +595,41 @@ mod tests {
             Some("unplugged-device"),
             "the choice must survive to the next launch"
         );
+    }
+
+    /// `apply_mode` backs both `commands::set_mode` and the tray's Mode
+    /// submenu, so all three of its jobs — apply the resting state, report the
+    /// mute state back, and persist the choice — are asserted here rather than
+    /// at either call site.
+    #[test]
+    fn apply_mode_mutes_reports_and_persists_on_entering_push_to_talk() {
+        let (mut core, dir) = fake_core(Mode::MuteToggle);
+        assert!(!core.machine.mic().is_muted().unwrap(), "Mute Toggle rests unmuted");
+
+        let muted = core.apply_mode(Mode::PushToTalk);
+
+        assert!(muted, "the caller needs the new mute state to pick a tray icon");
+        assert!(core.machine.mic().is_muted().unwrap());
+        assert_eq!(core.config.mode, Mode::PushToTalk);
+        assert_eq!(
+            Config::load(dir.path()).mode,
+            Mode::PushToTalk,
+            "the mode must survive to the next launch"
+        );
+    }
+
+    #[test]
+    fn toggle_mute_reports_the_state_it_left_behind() {
+        let (mut core, _dir) = fake_core(Mode::MuteToggle);
+        assert!(core.toggle_mute(), "the first toggle mutes");
+        assert!(!core.toggle_mute(), "the second unmutes");
+    }
+
+    #[test]
+    fn toggle_mute_is_a_no_op_in_push_to_talk() {
+        let (mut core, _dir) = fake_core(Mode::PushToTalk);
+        assert!(core.toggle_mute(), "PTT rests muted; the manual switch must not move it");
+        assert!(core.machine.mic().is_muted().unwrap());
     }
 
     #[test]
