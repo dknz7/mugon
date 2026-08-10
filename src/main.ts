@@ -1,5 +1,14 @@
 import { renderHero, setHeroMuted } from "./components/hero";
-import { api, onStateChanged, onLevel, onRecording, type AppState, type DeviceInfo, type Mode } from "./api";
+import {
+  api,
+  onStateChanged,
+  onLevel,
+  onRecording,
+  onDevicesChanged,
+  type AppState,
+  type DeviceInfo,
+  type Mode,
+} from "./api";
 import { renderMeter } from "./components/meter";
 import { initRecorder, renderRecorder } from "./components/hotkey-recorder";
 
@@ -152,6 +161,13 @@ onStateChanged(render);
 // 30Hz. Touches only the meter bar and its readout — never re-renders the
 // whole state on a level tick (amendment §7).
 onLevel((db) => renderMeter(els.meter, els.meterValue, db));
+// Hotplug (Task 9b). `refreshDevices` was left factored for exactly this
+// (§5) — nothing else here changes. The current selection comes from the
+// select element rather than a cached `AppState`: `renderDeviceOptions` has
+// already written it there, including the synthetic "(not connected)" option
+// for a saved-but-absent device, so reading it back preserves the user's
+// choice instead of snapping the dropdown to "System default".
+onDevicesChanged(() => refreshDevices(els.device.value || null));
 onRecording((_active, combo) => {
   recordingCombo = combo;
   renderRecorder(els.hotkeyDisplay, els.hotkeyRecord, els.hotkeyWarning, {

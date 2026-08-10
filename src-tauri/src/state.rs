@@ -92,6 +92,19 @@ impl Mic {
             Mic::Unavailable => None,
         }
     }
+
+    /// Starts device-hotplug notifications (§4.5).
+    ///
+    /// Not part of [`MicBackend`]: it is a one-shot startup wiring step, not
+    /// an operation on the microphone, and a machine with no working audio
+    /// stack has nothing to watch — hence the plain [`AudioError::NoDevice`]
+    /// rather than a silent success that would look like it worked.
+    pub fn enable_hotplug(&self, app: AppHandle) -> Result<(), AudioError> {
+        match self {
+            Mic::Live(handle) => handle.enable_hotplug(app),
+            Mic::Unavailable => Err(AudioError::NoDevice),
+        }
+    }
 }
 
 impl MicBackend for Mic {

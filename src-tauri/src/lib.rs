@@ -11,6 +11,7 @@
 //! | `mugon-hook-dispatch` | routing hook events into the recorder or the mode machine | **must not** be the hook thread: a slow Core Audio call there makes Windows silently uninstall the hook |
 //! | `mugon-meter` | the 30Hz `level` poll loop | polls through a `MeterTap`, never touches the `Core` lock; exists only while the settings window does |
 //! | `mugon-emergency-unmute` | a throwaway `Endpoint` | panic-hook only ([`emergency_unmute`]); never touches `Core`, because the panicking thread may be holding it |
+//! | *(Windows audio service)* | nothing | not ours: the `IMMNotificationClient` callback ([`audio::hotplug`]) runs on an arbitrary COM thread. It holds only a channel sender and an `AppHandle`, never blocks, and never touches an `Endpoint` or the `Core` lock |
 //!
 //! See [`state`]'s module docs for the locking discipline that keeps those
 //! last three from deadlocking against each other.
@@ -111,6 +112,25 @@ pub fn run() {
         ])
         .setup(move |app| {
             let handle = app.handle().clone();
+
+            // Task 9b (§4.5): start watching for capture devices arriving and
+            // leaving. This lives here rather than in `spawn_mic` above
+            // because the notification callback emits a Tauri event, and no
+            // `AppHandle` exists until now.
+            //
+            // Non-fatal, like every other startup step: without it the app
+            // simply stops noticing hotplug, which is exactly where it stood
+            // before this task. Logged rather than pushed into `last_error` —
+            // that field is "the last thing that went wrong with the device",
+            // and a missing notification client is not something the user can
+            // act on from the settings panel.
+            if let Some(core) = handle.try_state::<Shared>() {
+                let started =
+                    lock_or_recover(&core).machine.mic().enable_hotplug(handle.clone());
+                if let Err(e) = started {
+                    eprintln!("mugon: device hotplug notifications unavailable: {e}");
+                }
+            }
 
             // §4.10: metering is a property of the *window*, not of the
             // process. `tauri.conf.json` declares no window

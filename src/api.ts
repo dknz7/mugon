@@ -54,6 +54,18 @@ export const onStateChanged = (cb: (s: AppState) => void) =>
 export const onLevel = (cb: (peakDb: number) => void) =>
   listen<{ peak_db: number }>("level", (e) => cb(e.payload.peak_db));
 
+/**
+ * A capture device was added, removed, or became the new default.
+ *
+ * **No payload** — deliberately, superseding DESIGN.md §3's `DeviceInfo[]`.
+ * The event is raised from a COM notification thread that must not block, and
+ * enumerating devices means a round trip through the audio worker. So this is
+ * a bare signal: call `list_devices` in response. See
+ * `src-tauri/src/audio/hotplug.rs` and task-9b-brief.md §4.
+ */
+export const onDevicesChanged = (cb: () => void) =>
+  listen<null>("devices-changed", () => cb());
+
 export const onRecording = (cb: (active: boolean, combo: string | null) => void) =>
   listen<{ active: boolean; combo: string | null }>("hotkey-recording", (e) =>
     cb(e.payload.active, e.payload.combo),

@@ -2148,6 +2148,7 @@ dependencies = [
  "tempfile",
  "thiserror 1.0.69",
  "windows",
+ "windows-core 0.61.2",
 ]
 
 [[package]]

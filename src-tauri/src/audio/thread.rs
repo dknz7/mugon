@@ -20,6 +20,7 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
+use tauri::{AppHandle, Emitter};
 use windows::Win32::Foundation::{RPC_E_CHANGED_MODE, S_FALSE, S_OK};
 use windows::Win32::Media::Audio::{
     IAudioClient, IMMDevice, AUDCLNT_SHAREMODE_SHARED,
@@ -29,6 +30,7 @@ use windows::Win32::System::Com::{
 };
 
 use super::endpoint::{win, Endpoint};
+use super::hotplug;
 use super::{AudioError, DeviceInfo, MicBackend};
 
 /// The one error every "the worker is gone" path produces. Callers include
@@ -60,6 +62,24 @@ enum Command {
     StartMetering(Sender<Result<(), AudioError>>),
     /// Drops the worker's capture stream, if any. Idempotent.
     StopMetering(Sender<Result<(), AudioError>>),
+    /// Registers the [`hotplug`] notification client on the worker thread, so
+    /// device arrivals and departures start producing [`Command::DeviceChanged`].
+    ///
+    /// Carries the callback rather than a Tauri `AppHandle` because
+    /// [`MicHandle::enable_hotplug`] builds the closure on the caller's side —
+    /// which is what keeps this enum private to this module and keeps
+    /// `hotplug.rs` free of any dependency on it.
+    EnableHotplug(hotplug::OnChange, Sender<Result<(), AudioError>>),
+    /// The set of devices, or the default device, changed. **No reply sender,
+    /// deliberately.**
+    ///
+    /// This is sent from a COM notification callback on a thread belonging to
+    /// the Windows audio service. Waiting for a reply there would park that
+    /// thread — and if this worker happened to be inside a COM call at the
+    /// time, it would be one COM thread blocked on another. So it is
+    /// fire-and-forget: the sender returns immediately and never learns the
+    /// outcome. The handler in [`run`] logs its own failures for that reason.
+    DeviceChanged,
     Shutdown,
 }
 
@@ -155,6 +175,35 @@ impl MicBackend for MtaEndpoint {
         self.endpoint.peak()
     }
 }
+
+/// Backends that can re-resolve their device after a hotplug event.
+///
+/// Deliberately **not** a method on [`MicBackend`]. Only the real endpoint has
+/// a device to re-resolve; putting a defaulted `refresh` on `MicBackend` would
+/// silently hand [`MicHandle`] and `state::Mic` a `refresh()` that compiles,
+/// looks like it works and does nothing — a trap for whoever calls it next.
+/// Confining it to a worker-private trait means the only type that can be
+/// asked to refresh is one the worker actually owns.
+///
+/// The default is a no-op for the same reason [`MeterCapture`]'s is: every
+/// backend that is not a real endpoint has nothing to re-resolve, so a device
+/// change is correctly a no-op rather than an error.
+pub(crate) trait DeviceRefresh {
+    fn refresh(&mut self) -> Result<(), AudioError> {
+        Ok(())
+    }
+}
+
+impl DeviceRefresh for MtaEndpoint {
+    /// The first and only caller [`Endpoint::refresh`] has ever had — it was
+    /// built for this in Task 5 and has been waiting since.
+    fn refresh(&mut self) -> Result<(), AudioError> {
+        self.endpoint.refresh()
+    }
+}
+
+#[cfg(test)]
+impl DeviceRefresh for super::fake::FakeMic {}
 
 /// A live WASAPI capture stream, held open for exactly one reason: as long as
 /// it exists, the endpoint's `IAudioMeterInformation::GetPeakValue` keeps
@@ -318,7 +367,7 @@ impl MicHandle {
     /// tests already use, not a new one grown just for them.
     pub(crate) fn spawn_with<B, F>(make: F) -> Result<Self, AudioError>
     where
-        B: MicBackend + MeterCapture + 'static,
+        B: MicBackend + MeterCapture + DeviceRefresh + 'static,
         F: FnOnce() -> Result<B, AudioError> + Send + 'static,
     {
         let (tx, rx) = mpsc::channel::<Command>();
@@ -367,6 +416,41 @@ impl MicHandle {
     /// capture stream needs exactly one owner.
     pub fn tap(&self) -> MeterTap {
         MeterTap { tx: self.tx.clone() }
+    }
+
+    /// Starts listening for capture-device arrivals, departures and
+    /// default-device changes (§4.5).
+    ///
+    /// Separate from [`Self::spawn`] because registering the notification
+    /// client needs an `AppHandle` to emit through, and no `AppHandle` exists
+    /// until Tauri's `setup` runs — by which point the worker has been serving
+    /// for a while. Call it once, from `setup`.
+    ///
+    /// The closure built here is everything a COM notification thread will
+    /// ever do, and both halves of it are non-blocking by construction:
+    ///
+    /// - the [`Command::DeviceChanged`] send has no reply channel, so it
+    ///   cannot wait on the worker;
+    /// - `AppHandle::emit` is `Send + Sync` and queues to the webview.
+    ///
+    /// Neither touches an `Endpoint`, and neither can, because a closure that
+    /// is `Send + Sync` cannot capture one.
+    ///
+    /// Both failures are swallowed inside the closure on purpose: by the time
+    /// a notification arrives, a dead worker or a torn-down webview is not
+    /// something a callback can act on, and returning an error from an
+    /// `IMMNotificationClient` method does nothing useful either.
+    ///
+    /// Blocks on a reply, unlike the callback path — this runs on the main
+    /// thread at startup against an idle worker, and a registration that
+    /// silently failed would leave hotplug quietly dead with no diagnostic.
+    pub fn enable_hotplug(&self, app: AppHandle) -> Result<(), AudioError> {
+        let tx = self.tx.clone();
+        let on_change: hotplug::OnChange = Box::new(move || {
+            let _ = tx.send(Command::DeviceChanged);
+            let _ = app.emit(hotplug::DEVICES_CHANGED, ());
+        });
+        self.call(|reply| Command::EnableHotplug(on_change, reply))
     }
 }
 
@@ -517,6 +601,33 @@ impl Drop for MicHandle {
     }
 }
 
+/// Re-points a *running* capture stream at whatever device the backend now
+/// tracks. A no-op when nothing is metering — there is no stream to move.
+///
+/// Shared by the two arms that can change which device the endpoint points at,
+/// [`Command::Select`] and [`Command::DeviceChanged`], because the hazard is
+/// identical in both and so is the fix. A stream stays pinned to the
+/// `IMMDevice` it was opened against, so leaving it alone across a device
+/// change strands Windows' microphone-in-use indicator lit on the old device —
+/// possibly one the user has just unplugged — while the meter reads dead
+/// silence on the new one.
+///
+/// Failure is non-fatal, matching [`Command::StartMetering`]'s policy: log it
+/// and let the meter fall back to passive polling rather than taking the
+/// worker down over an optional stream.
+fn reopen_capture<B: MeterCapture>(backend: &B, capture: &mut Option<B::Stream>) {
+    if capture.is_none() {
+        return;
+    }
+    // Dropped *before* the reopen, not swapped after it: the old device must
+    // be released before a second stream is opened, or both are held at once.
+    *capture = None;
+    match backend.open_capture_stream() {
+        Ok(stream) => *capture = stream,
+        Err(e) => eprintln!("mugon: failed to reopen capture stream after device change: {e}"),
+    }
+}
+
 /// The worker thread body: construct, report, serve, tear down.
 ///
 /// `_done` is never sent on and is never named again. It is a parameter rather
@@ -530,7 +641,7 @@ fn run<B, F>(
     rx: Receiver<Command>,
     _done: Sender<()>,
 ) where
-    B: MicBackend + MeterCapture,
+    B: MicBackend + MeterCapture + DeviceRefresh,
     F: FnOnce() -> Result<B, AudioError>,
 {
     let mut backend = match make() {
@@ -556,8 +667,21 @@ fn run<B, F>(
     // channel, or an explicit `StopMetering`.
     let mut capture: Option<B::Stream> = None;
 
+    // Declared last so it drops *first*: the notification client must be
+    // unregistered while this thread is still in the MTA and the enumerator it
+    // registered on is still alive — i.e. before `capture` and before
+    // `backend` (and, for the real backend, before `CoUninitialize`).
+    let mut hotplug: Option<hotplug::Registration> = None;
+
     // `recv` returning `Err` means every sender is gone — the handle was
     // dropped without a clean shutdown. Same exit path either way.
+    //
+    // Note that once hotplug is registered this arm becomes unreachable: the
+    // notification client holds a `Sender<Command>`, so the channel can no
+    // longer disconnect while the worker is running. That is safe because
+    // `MicHandle` is the sole owner of this worker and its `Drop` always sends
+    // `Shutdown` first — the disconnect arm is a belt-and-braces fallback, not
+    // the primary exit.
     while let Ok(command) = rx.recv() {
         match command {
             Command::ListDevices(reply) => {
@@ -565,27 +689,11 @@ fn run<B, F>(
             }
             Command::Select(id, reply) => {
                 let result = backend.select(id.as_deref());
-                // A running meter's capture stream is pinned to whichever
-                // `IMMDevice` was selected when it was opened. If `select`
-                // just moved the endpoint to a different device, that stream
-                // is now stranded on the *old* one: the mic-in-use indicator
-                // stays lit there indefinitely, and the meter goes dead
-                // because nothing is capturing the newly-selected endpoint —
-                // exactly the privacy-visible failure this design exists to
-                // avoid. So: drop it and reopen against the new device.
-                if result.is_ok() && capture.is_some() {
-                    capture = None;
-                    match backend.open_capture_stream() {
-                        Ok(stream) => capture = stream,
-                        // Same non-fatal policy as `StartMetering`: log and
-                        // fall back to passive polling rather than taking
-                        // the worker down over an optional stream.
-                        Err(e) => {
-                            eprintln!(
-                                "mugon: failed to reopen capture stream after device change: {e}"
-                            );
-                        }
-                    }
+                // A successful `select` may have moved the endpoint to a
+                // different device; a running capture stream has to follow it.
+                // See [`reopen_capture`].
+                if result.is_ok() {
+                    reopen_capture(&backend, &mut capture);
                 }
                 let _ = reply.send(result);
             }
@@ -629,11 +737,40 @@ fn run<B, F>(
                 capture = None;
                 let _ = reply.send(Ok(()));
             }
+            Command::EnableHotplug(on_change, reply) => {
+                // Registration happens here, on the worker thread, because
+                // this is the thread that is in the MTA — and because it is
+                // the thread whose exit must undo it.
+                let result = hotplug::Registration::new(on_change).map(|registration| {
+                    // Assigning over an existing registration unregisters it
+                    // on drop, so a second call replaces rather than stacks.
+                    hotplug = Some(registration);
+                });
+                let _ = reply.send(result);
+            }
+            Command::DeviceChanged => match backend.refresh() {
+                // The endpoint now points at whatever `selected_id` resolves
+                // to today; a running capture stream has to follow it, exactly
+                // as it does after a `Select`.
+                Ok(()) => reopen_capture(&backend, &mut capture),
+                // **`selected_id` is deliberately left alone.** The device the
+                // user picked may be merely absent — disabled, or unplugged —
+                // and keeping the choice means the next notification, when
+                // they plug it back in, restores it with no further action.
+                // Clearing it here would silently and permanently demote them
+                // to the system default. Same policy as a failed `select`.
+                //
+                // Nothing to reply to (see `Command::DeviceChanged`), so the
+                // log is the only channel this failure has.
+                Err(e) => eprintln!("mugon: could not re-resolve the device after a change: {e}"),
+            },
             Command::Shutdown => break,
         }
     }
-    // `capture` drops here first (stopping any open stream), then `backend`,
-    // releasing the COM interfaces and then the apartment.
+    // Locals drop in reverse declaration order, so: `hotplug` unregisters the
+    // notification client (releasing the `Sender<Command>` it held), then
+    // `capture` stops any open stream, then `backend` releases the COM
+    // interfaces and finally the apartment.
 }
 
 #[cfg(test)]
@@ -701,6 +838,10 @@ mod tests {
         type Stream = ();
     }
 
+    /// No device to re-resolve; takes the trivial default (see
+    /// [`DeviceRefresh`]).
+    impl DeviceRefresh for SharedFake {}
+
     /// Spawns a worker over a shared `FakeMic` and returns the handle plus a
     /// window onto the fake's recorded state.
     fn spawn_fake() -> (MicHandle, Arc<Mutex<FakeMic>>) {
@@ -725,18 +866,55 @@ mod tests {
         backend: SharedFake,
         opens: Arc<AtomicUsize>,
         fail_open: Arc<AtomicBool>,
+        /// Counts [`DeviceRefresh::refresh`] calls, and — when `fail_refresh`
+        /// is set — makes them fail. Task 9b's hotplug handler is the only
+        /// caller of `refresh`, so without these there is no way to tell a
+        /// `DeviceChanged` that refreshed from one that quietly did nothing.
+        refreshes: Arc<AtomicUsize>,
+        fail_refresh: Arc<AtomicBool>,
+    }
+
+    /// The knobs and counters [`CountingCaptureFake`] exposes to a test, bundled
+    /// so `spawn_counting_fake` returns two values instead of six.
+    struct CaptureProbe {
+        view: Arc<Mutex<FakeMic>>,
+        opens: Arc<AtomicUsize>,
+        fail_open: Arc<AtomicBool>,
+        refreshes: Arc<AtomicUsize>,
+        fail_refresh: Arc<AtomicBool>,
+    }
+
+    impl CaptureProbe {
+        fn opens(&self) -> usize {
+            self.opens.load(Ordering::SeqCst)
+        }
+        fn refreshes(&self) -> usize {
+            self.refreshes.load(Ordering::SeqCst)
+        }
+        fn selected(&self) -> Option<String> {
+            match self.view.lock() {
+                Ok(guard) => guard.selected.clone(),
+                Err(poisoned) => poisoned.into_inner().selected.clone(),
+            }
+        }
     }
 
     impl CountingCaptureFake {
-        fn new() -> (Self, Arc<Mutex<FakeMic>>, Arc<AtomicUsize>, Arc<AtomicBool>) {
+        fn new() -> (Self, CaptureProbe) {
             let (backend, view) = SharedFake::new();
             let opens = Arc::new(AtomicUsize::new(0));
             let fail_open = Arc::new(AtomicBool::new(false));
+            let refreshes = Arc::new(AtomicUsize::new(0));
+            let fail_refresh = Arc::new(AtomicBool::new(false));
             (
-                Self { backend, opens: Arc::clone(&opens), fail_open: Arc::clone(&fail_open) },
-                view,
-                opens,
-                fail_open,
+                Self {
+                    backend,
+                    opens: Arc::clone(&opens),
+                    fail_open: Arc::clone(&fail_open),
+                    refreshes: Arc::clone(&refreshes),
+                    fail_refresh: Arc::clone(&fail_refresh),
+                },
+                CaptureProbe { view, opens, fail_open, refreshes, fail_refresh },
             )
         }
     }
@@ -778,14 +956,38 @@ mod tests {
         }
     }
 
+    /// Counts and optionally fails, but — like `Endpoint::refresh` — never
+    /// touches the selection. The tests below rely on that: if a
+    /// `DeviceChanged` ever clears `selected`, it can only have been the
+    /// worker's handler that did it.
+    impl DeviceRefresh for CountingCaptureFake {
+        fn refresh(&mut self) -> Result<(), AudioError> {
+            self.refreshes.fetch_add(1, Ordering::SeqCst);
+            if self.fail_refresh.load(Ordering::SeqCst) {
+                return Err(AudioError::DeviceNotFound("simulated missing device".into()));
+            }
+            Ok(())
+        }
+    }
+
     /// Spawns a worker over a [`CountingCaptureFake`] and returns the handle
-    /// plus handles onto its recorded state (mute view, open count, and a
-    /// switch to make the *next* open fail).
-    fn spawn_counting_fake(
-    ) -> (MicHandle, Arc<Mutex<FakeMic>>, Arc<AtomicUsize>, Arc<AtomicBool>) {
-        let (backend, view, opens, fail_open) = CountingCaptureFake::new();
+    /// plus the [`CaptureProbe`] onto its recorded state.
+    fn spawn_counting_fake() -> (MicHandle, CaptureProbe) {
+        let (backend, probe) = CountingCaptureFake::new();
         let handle = MicHandle::spawn_with(move || Ok(backend)).expect("fake backend must spawn");
-        (handle, view, opens, fail_open)
+        (handle, probe)
+    }
+
+    /// `DeviceChanged` carries no reply channel, so a test cannot wait on it
+    /// the way it waits on every other command. This rides a *replying*
+    /// command in behind it: the worker services its queue strictly in order,
+    /// so once `is_muted` has answered, the `DeviceChanged` ahead of it has
+    /// certainly been handled.
+    ///
+    /// A sleep would work too and would be flaky; this is exact.
+    fn send_device_changed(mic: &MicHandle) {
+        mic.tx.send(Command::DeviceChanged).expect("worker still alive");
+        mic.is_muted().expect("the worker must still be serving after a device change");
     }
 
     #[test]
@@ -906,6 +1108,8 @@ mod tests {
         type Stream = ();
     }
 
+    impl DeviceRefresh for PanickingFake {}
+
     /// The panic hook is process-global, so the two tests that deliberately
     /// panic a worker serialise on this and put the previous hook back.
     /// Suppressing it keeps a real backtrace out of otherwise-clean output.
@@ -999,6 +1203,8 @@ mod tests {
     impl MeterCapture for WedgedFake {
         type Stream = ();
     }
+
+    impl DeviceRefresh for WedgedFake {}
 
     /// The property: a caller waiting on a worker that never replies gets an
     /// error, not a permanent block. Without the bound this test would hang
@@ -1231,18 +1437,18 @@ mod tests {
     /// [`CountingCaptureFake`], which returns a real `Some` and counts calls.
     #[test]
     fn start_metering_twice_opens_the_capture_stream_exactly_once() {
-        let (_mic, _view, opens, _fail_open) = spawn_counting_fake();
-        let tap = _mic.tap();
+        let (mic, probe) = spawn_counting_fake();
+        let tap = mic.tap();
 
         tap.start_metering().unwrap();
         tap.start_metering().unwrap();
-        assert_eq!(opens.load(Ordering::SeqCst), 1, "second start must not reopen");
+        assert_eq!(probe.opens(), 1, "second start must not reopen");
     }
 
     #[test]
     fn stop_metering_twice_is_a_no_op_not_an_error() {
-        let (_mic, _view, _opens, _fail_open) = spawn_counting_fake();
-        let tap = _mic.tap();
+        let (mic, _probe) = spawn_counting_fake();
+        let tap = mic.tap();
 
         tap.start_metering().unwrap();
         tap.stop_metering().unwrap();
@@ -1256,19 +1462,19 @@ mod tests {
     /// failure this design exists to avoid.
     #[test]
     fn selecting_a_new_device_while_metering_reopens_the_capture_stream() {
-        let (mut mic, _view, opens, _fail_open) = spawn_counting_fake();
+        let (mut mic, probe) = spawn_counting_fake();
         let tap = mic.tap();
 
         tap.start_metering().unwrap();
-        assert_eq!(opens.load(Ordering::SeqCst), 1, "initial open");
+        assert_eq!(probe.opens(), 1, "initial open");
 
         mic.select(Some("device-2")).unwrap();
-        assert_eq!(opens.load(Ordering::SeqCst), 2, "select must reopen against the new device");
+        assert_eq!(probe.opens(), 2, "select must reopen against the new device");
 
         // And the reopened stream is tracked correctly: a further
         // `start_metering` must not open a *third* time.
         tap.start_metering().unwrap();
-        assert_eq!(opens.load(Ordering::SeqCst), 2, "already open after the reopen");
+        assert_eq!(probe.opens(), 2, "already open after the reopen");
     }
 
     /// The non-fatal policy applies to the reopen path too: if the new
@@ -1277,14 +1483,14 @@ mod tests {
     /// the meter simply falling back to passive polling.
     #[test]
     fn a_failed_reopen_on_device_change_does_not_fail_select_or_kill_the_worker() {
-        let (mut mic, _view, opens, fail_open) = spawn_counting_fake();
+        let (mut mic, probe) = spawn_counting_fake();
         let tap = mic.tap();
 
         tap.start_metering().unwrap();
-        fail_open.store(true, Ordering::SeqCst);
+        probe.fail_open.store(true, Ordering::SeqCst);
 
         mic.select(Some("device-2")).expect("select must succeed even if the reopen fails");
-        assert_eq!(opens.load(Ordering::SeqCst), 2, "a reopen must still be attempted");
+        assert_eq!(probe.opens(), 2, "a reopen must still be attempted");
 
         // Worker is still alive and serving.
         assert!(!mic.is_muted().unwrap());
@@ -1294,9 +1500,120 @@ mod tests {
     /// capture stream at all — there is nothing to reopen.
     #[test]
     fn selecting_a_device_without_an_active_meter_does_not_open_a_stream() {
-        let (mut mic, _view, opens, _fail_open) = spawn_counting_fake();
+        let (mut mic, probe) = spawn_counting_fake();
         mic.select(Some("device-2")).unwrap();
-        assert_eq!(opens.load(Ordering::SeqCst), 0);
+        assert_eq!(probe.opens(), 0);
+    }
+
+    // ---- Task 9b: `Command::DeviceChanged` ----------------------------------
+
+    /// The headline property: a hotplug event must move a running capture
+    /// stream onto whatever device the endpoint now resolves to. Left on the
+    /// old one, Windows' microphone-in-use indicator stays lit on hardware the
+    /// user has just unplugged, and the meter reads silence forever.
+    #[test]
+    fn a_device_change_while_metering_refreshes_and_reopens_the_capture_stream() {
+        let (mic, probe) = spawn_counting_fake();
+        let tap = mic.tap();
+
+        tap.start_metering().unwrap();
+        assert_eq!(probe.opens(), 1, "initial open");
+
+        send_device_changed(&mic);
+
+        assert_eq!(probe.refreshes(), 1, "the handler must re-resolve the device");
+        assert_eq!(probe.opens(), 2, "the stream must follow the device");
+
+        // The reopened stream is tracked, not leaked: a later `start_metering`
+        // must find one already open rather than opening a third.
+        tap.start_metering().unwrap();
+        assert_eq!(probe.opens(), 2, "already open after the reopen");
+    }
+
+    /// With no meter running there is no stream to move, so a device change
+    /// must refresh and stop there — not open a stream nobody asked for, which
+    /// would light the microphone indicator with the settings window closed.
+    #[test]
+    fn a_device_change_without_an_active_meter_refreshes_but_opens_nothing() {
+        let (mic, probe) = spawn_counting_fake();
+
+        send_device_changed(&mic);
+
+        assert_eq!(probe.refreshes(), 1);
+        assert_eq!(probe.opens(), 0, "a closed meter must stay closed");
+    }
+
+    /// A device that is merely absent — disabled in Sound settings, or
+    /// unplugged — must not cost the user their choice. Keeping `selected_id`
+    /// is what makes a replug restore it by itself, and it matches the
+    /// behaviour Task 9 established for a failed `select`.
+    #[test]
+    fn a_failed_refresh_leaves_the_selected_device_intact() {
+        let (mut mic, probe) = spawn_counting_fake();
+        mic.select(Some("device-2")).unwrap();
+        assert_eq!(probe.selected().as_deref(), Some("device-2"));
+
+        probe.fail_refresh.store(true, Ordering::SeqCst);
+        send_device_changed(&mic);
+
+        assert_eq!(probe.refreshes(), 1, "the handler must have tried");
+        assert_eq!(
+            probe.selected().as_deref(),
+            Some("device-2"),
+            "a failed refresh must not demote the user to the system default"
+        );
+    }
+
+    /// The other half of a failed refresh: the endpoint never moved, so the
+    /// stream is still valid and must be left alone. Tearing it down and
+    /// reopening it against the same dead device would drop metering for no
+    /// reason — and could fail, leaving nothing at all.
+    #[test]
+    fn a_failed_refresh_does_not_disturb_a_running_capture_stream() {
+        let (mic, probe) = spawn_counting_fake();
+        let tap = mic.tap();
+
+        tap.start_metering().unwrap();
+        probe.fail_refresh.store(true, Ordering::SeqCst);
+
+        send_device_changed(&mic);
+
+        assert_eq!(probe.opens(), 1, "the stream must not be reopened when nothing moved");
+    }
+
+    /// A notification storm must not take the worker down, and each event must
+    /// leave exactly one stream open rather than stacking them.
+    #[test]
+    fn repeated_device_changes_keep_exactly_one_stream_open() {
+        let (mut mic, probe) = spawn_counting_fake();
+        let tap = mic.tap();
+        tap.start_metering().unwrap();
+
+        for _ in 0..5 {
+            send_device_changed(&mic);
+        }
+
+        assert_eq!(probe.refreshes(), 5);
+        assert_eq!(probe.opens(), 6, "one initial open plus one reopen per change");
+        // Still serving, and still holding a single stream.
+        tap.start_metering().unwrap();
+        assert_eq!(probe.opens(), 6);
+        assert!(!mic.is_muted().unwrap());
+        mic.select(None).expect("the worker must still accept ordinary commands");
+    }
+
+    /// A device change against a dead worker must be a silent no-op, not a
+    /// panic: `Command::DeviceChanged` is sent from a COM notification thread
+    /// belonging to the Windows audio service, which is the last thread in the
+    /// process that should be unwinding.
+    #[test]
+    fn a_device_change_sent_to_a_dead_worker_is_dropped_silently() {
+        let (mic, _probe) = spawn_counting_fake();
+        let orphan = mic.tx.clone();
+        drop(mic);
+
+        // Exactly what the closure in `enable_hotplug` does.
+        let _ = orphan.send(Command::DeviceChanged);
     }
 
     /// The ambiguity this project's Task 8 brief flagged directly: a live
@@ -1356,6 +1673,59 @@ mod tests {
         tap.stop_metering().expect("second stop must also succeed");
 
         // Metering never touches mute state; nothing to restore here.
+        drop(mic);
+    }
+
+    /// `Endpoint::refresh()` against real hardware, driven the way a hotplug
+    /// callback drives it — and the first time it has had a caller at all
+    /// since it was written in Task 5.
+    ///
+    /// This does not need a device to actually appear or disappear: the
+    /// command is what the callback sends, so injecting it exercises the whole
+    /// worker-side path (re-resolve, drop the stream, reopen against whatever
+    /// the endpoint now points at) on real COM interfaces. Whether Windows
+    /// delivers the callback in the first place is
+    /// `hotplug::tests::a_real_device_change_reaches_the_watcher`'s job.
+    ///
+    /// Nothing is asserted until the microphone's original mute state has been
+    /// written back, so a failure here cannot leave it muted.
+    #[test]
+    #[ignore = "requires real audio hardware; run with --ignored"]
+    fn a_real_device_change_refreshes_the_endpoint_and_reopens_the_capture_stream() {
+        let mut mic = MicHandle::spawn().expect("no capture endpoint");
+        let tap = mic.tap();
+
+        let original = mic.is_muted().expect("is_muted before the test");
+
+        tap.start_metering().expect("capture stream must open on real hardware");
+        std::thread::sleep(Duration::from_millis(50));
+        let before = tap.peak().expect("peak before the device change");
+
+        // Byte-for-byte what the notification callback sends: no reply channel.
+        mic.tx.send(Command::DeviceChanged).expect("worker still alive");
+
+        // The worker services its queue in order, so this reply returning
+        // proves the refresh and the reopen have already happened.
+        let after_refresh = mic.is_muted().expect("the endpoint must answer after a refresh");
+        std::thread::sleep(Duration::from_millis(50));
+        let after = tap.peak().expect("the meter must still be live after the reopen");
+
+        tap.stop_metering().expect("capture stream must close");
+        let restore = mic.set_muted(original);
+        let restored = mic.is_muted();
+
+        println!(
+            "mute: original={original} after_refresh={after_refresh} restored={restored:?} \
+             peak_before={before} peak_after={after}"
+        );
+
+        restore.expect("must restore the original mute state");
+        assert_eq!(restored.unwrap(), original, "microphone left in the wrong state");
+        assert_eq!(after_refresh, original, "a refresh must not change the mute state");
+        assert!((0.0..=1.0).contains(&after), "peak out of range after the reopen: {after}");
+
+        // Drop joins the worker, which unregisters nothing here (hotplug was
+        // never enabled) and releases the endpoint and the apartment.
         drop(mic);
     }
 }
