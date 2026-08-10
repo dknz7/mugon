@@ -36,7 +36,7 @@ use audio::MicBackend;
 use config::{Config, NotificationPrefs};
 use hotkey::hook::{self, HookEvent};
 use hotkey::recorder::{Recorder, RecorderOutcome};
-use modes::{KeyEdge, Mode, ModeMachine};
+use modes::{KeyEdge, KeyObservation, Mode, ModeMachine};
 use state::{emit_state, lock_or_recover, Core, Meter, Mic, Shared};
 
 /// Live combo feedback while the hotkey recorder is running (DESIGN.md §3).
@@ -163,6 +163,13 @@ pub fn run() {
             std::thread::Builder::new()
                 .name("mugon-hook-dispatch".into())
                 .spawn(move || dispatch_hook_events(dispatch_app, rx))?;
+
+            // §4.3. The hook can miss a key-up; nothing else in the app would
+            // ever notice, and in Push to Talk that leaves the microphone live.
+            let watchdog_app = handle.clone();
+            std::thread::Builder::new()
+                .name("mugon-watchdog".into())
+                .spawn(move || run_stuck_key_watchdog(watchdog_app))?;
 
             tray::build(app.handle())?;
             Ok(())
@@ -361,22 +368,84 @@ fn dispatch_hook_events(app: AppHandle, rx: mpsc::Receiver<HookEvent>) {
             handle_hook_event(&mut c, &ev)
         };
 
-        match follow {
-            Follow::Nothing => {}
-            Follow::Emit => emit_state(&app),
-            Follow::Recording(combo) => {
-                let _ = app.emit(
-                    HOTKEY_RECORDING,
-                    serde_json::json!({ "active": true, "combo": combo }),
-                );
-            }
-            Follow::MuteChanged { mode, muted, prefs } => {
-                notify::on_mute_change(&app, mode, muted, &prefs);
-                tray::update_icon(&app, muted);
-                emit_state(&app);
-            }
+        run_follow(&app, follow);
+    }
+}
+
+/// Performs a [`Follow`]. **Must be called with no lock held** — every arm
+/// either re-enters the `Core` lock or marshals onto the UI thread.
+fn run_follow(app: &AppHandle, follow: Follow) {
+    match follow {
+        Follow::Nothing => {}
+        Follow::Emit => emit_state(app),
+        Follow::Recording(combo) => {
+            let _ = app.emit(
+                HOTKEY_RECORDING,
+                serde_json::json!({ "active": true, "combo": combo }),
+            );
+        }
+        Follow::MuteChanged { mode, muted, prefs } => {
+            notify::on_mute_change(app, mode, muted, &prefs);
+            tray::update_icon(app, muted);
+            emit_state(app);
         }
     }
+}
+
+/// §4.3's poll interval. Fast enough that a latched-open microphone is measured
+/// in fractions of a second, slow enough to be free: a poll that finds nothing
+/// wrong is a `GetAsyncKeyState` and two field reads under the `Core` lock, and
+/// never talks to the audio worker.
+const WATCHDOG_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// The stuck-key watchdog (§4.3).
+///
+/// Runs for the life of the process on its own thread. It is the only thing
+/// standing between a missed key-up and a microphone that stays live
+/// indefinitely — a UAC prompt, `Win+L`, or an elevated window taking the
+/// foreground all stop the hook receiving events, and in Push to Talk the hold
+/// then never ends.
+///
+/// Deliberately **not** on the hook thread (a Core Audio call there makes
+/// Windows silently uninstall the hook) and not on the UI thread (it would
+/// block the event loop on an audio round trip). Same lock discipline as the
+/// hook dispatch loop: decide under the lock, act after it.
+fn run_stuck_key_watchdog(app: AppHandle) {
+    loop {
+        std::thread::sleep(WATCHDOG_INTERVAL);
+
+        // Gone means the app is tearing down; there is nothing left to guard.
+        let Some(core) = app.try_state::<Shared>() else {
+            return;
+        };
+
+        let follow = {
+            let mut c = lock_or_recover(&core);
+            watchdog_poll(&mut c, hook::is_physically_down)
+        };
+        run_follow(&app, follow);
+    }
+}
+
+/// One watchdog poll, **under the `Core` lock**, as a function of the state and
+/// a key-state probe.
+///
+/// The probe is a parameter rather than a direct `GetAsyncKeyState` call so the
+/// whole poll — decision *and* its effect on the microphone — is testable
+/// against a fake-backed `Core`, which is the point: a watchdog that only fires
+/// in situations nobody can reproduce is a watchdog nobody can trust.
+fn watchdog_poll(c: &mut Core, physically_down: impl Fn(u16) -> bool) -> Follow {
+    let observation = KeyObservation {
+        mode: c.machine.mode(),
+        held: c.machine.is_held(),
+        physically_down: c.config.hotkey.map(|binding| physically_down(binding.vk)),
+    };
+    if !observation.release_required() {
+        return Follow::Nothing;
+    }
+
+    eprintln!("mugon: stuck-key watchdog forced the push-to-talk release path (§4.3)");
+    apply_edge(c, KeyEdge::Up)
 }
 
 /// Everything [`dispatch_hook_events`] does **while holding the `Core` lock**,
@@ -409,8 +478,18 @@ fn handle_hook_event(c: &mut Core, ev: &HookEvent) -> Follow {
         return Follow::Nothing;
     }
 
+    apply_edge(c, if ev.down { KeyEdge::Down } else { KeyEdge::Up })
+}
+
+/// Drives one key edge through the mode machine and reports what changed.
+///
+/// Shared by the hook dispatch path and the stuck-key watchdog, which must
+/// produce identical follow-ups: a forced release has to swap the tray icon,
+/// beep and push state exactly as a real key-up would, or the user is left
+/// looking at a "live" tray icon over a muted microphone.
+fn apply_edge(c: &mut Core, edge: KeyEdge) -> Follow {
     let before = c.machine.mic().is_muted();
-    c.machine.on_key(if ev.down { KeyEdge::Down } else { KeyEdge::Up });
+    c.machine.on_key(edge);
     let after = c.machine.mic().is_muted();
     c.record_outcome(&after);
 
@@ -562,6 +641,117 @@ mod tests {
     /// A dead or absent mic must surface rather than silently doing nothing:
     /// the read fails, so the change is unknowable and the reason goes to the
     /// UI.
+    // --- Stuck-key watchdog (§4.3) ---
+
+    /// Probes that stand in for `GetAsyncKeyState`.
+    const KEY_IS_UP: fn(u16) -> bool = |_| false;
+    const KEY_IS_DOWN: fn(u16) -> bool = |_| true;
+
+    /// The failure this whole feature exists for: PTT held, the key-up lost to
+    /// a UAC prompt, and the microphone live with nothing to close it.
+    #[test]
+    fn the_watchdog_remutes_a_ptt_hold_whose_key_up_never_arrived() {
+        let (mut core, _dir) = bound_core(Mode::PushToTalk);
+        let _ = handle_hook_event(&mut core, &ev(F13, true));
+        assert!(!core.machine.mic().is_muted().unwrap(), "sanity: the hold went live");
+
+        match watchdog_poll(&mut core, KEY_IS_UP) {
+            Follow::MuteChanged { mode, muted, .. } => {
+                assert_eq!(mode, Mode::PushToTalk);
+                assert!(muted, "the forced release must report the mic going quiet");
+            }
+            other => panic!("expected a mute change, got {other:?}"),
+        }
+        assert!(core.machine.mic().is_muted().unwrap());
+        assert!(!core.machine.is_held(), "the hold must be cleared, not just the mute");
+    }
+
+    /// The case that runs four times a second for as long as anyone speaks.
+    /// Getting this wrong cuts the user off mid-sentence.
+    #[test]
+    fn the_watchdog_leaves_a_genuine_hold_alone() {
+        let (mut core, _dir) = bound_core(Mode::PushToTalk);
+        let _ = handle_hook_event(&mut core, &ev(F13, true));
+
+        for _ in 0..8 {
+            assert!(matches!(watchdog_poll(&mut core, KEY_IS_DOWN), Follow::Nothing));
+        }
+        assert!(!core.machine.mic().is_muted().unwrap(), "a real hold must stay live");
+        assert!(core.machine.is_held());
+    }
+
+    #[test]
+    fn the_watchdog_is_silent_when_nothing_is_held() {
+        let (mut core, _dir) = bound_core(Mode::PushToTalk);
+        assert!(matches!(watchdog_poll(&mut core, KEY_IS_UP), Follow::Nothing));
+        assert!(core.machine.mic().is_muted().unwrap(), "PTT rests muted, untouched");
+    }
+
+    /// Mute Toggle's `held` flag only suppresses auto-repeat. Forcing an edge
+    /// through it would be a mute change the user did not ask for.
+    #[test]
+    fn the_watchdog_never_touches_mute_toggle() {
+        let (mut core, _dir) = bound_core(Mode::MuteToggle);
+        let _ = handle_hook_event(&mut core, &ev(F13, true));
+        let muted = core.machine.mic().is_muted().unwrap();
+
+        assert!(matches!(watchdog_poll(&mut core, KEY_IS_UP), Follow::Nothing));
+        assert_eq!(core.machine.mic().is_muted().unwrap(), muted, "the mic must not move");
+    }
+
+    /// Clearing the hotkey mid-hold removes the only thing that could have
+    /// matched the key-up, so nothing would ever end the hold.
+    #[test]
+    fn the_watchdog_releases_a_hold_whose_binding_was_cleared() {
+        let (mut core, _dir) = bound_core(Mode::PushToTalk);
+        let _ = handle_hook_event(&mut core, &ev(F13, true));
+        core.config.hotkey = None;
+
+        assert!(matches!(watchdog_poll(&mut core, KEY_IS_DOWN), Follow::MuteChanged { muted: true, .. }));
+        assert!(core.machine.mic().is_muted().unwrap());
+    }
+
+    /// A watchdog that re-fires forever would beep and re-emit four times a
+    /// second for the rest of the session.
+    #[test]
+    fn the_watchdog_fires_once_and_then_settles() {
+        let (mut core, _dir) = bound_core(Mode::PushToTalk);
+        let _ = handle_hook_event(&mut core, &ev(F13, true));
+
+        assert!(matches!(watchdog_poll(&mut core, KEY_IS_UP), Follow::MuteChanged { .. }));
+        for _ in 0..4 {
+            assert!(matches!(watchdog_poll(&mut core, KEY_IS_UP), Follow::Nothing));
+        }
+    }
+
+    /// The hardware key-up routinely arrives after the watchdog has already
+    /// acted — the UAC prompt is dismissed, the screen is unlocked. It must not
+    /// produce a second mute change.
+    #[test]
+    fn a_late_real_key_up_after_a_forced_release_is_a_noop() {
+        let (mut core, _dir) = bound_core(Mode::PushToTalk);
+        let _ = handle_hook_event(&mut core, &ev(F13, true));
+        let _ = watchdog_poll(&mut core, KEY_IS_UP);
+
+        assert!(matches!(handle_hook_event(&mut core, &ev(F13, false)), Follow::Nothing));
+        assert!(core.machine.mic().is_muted().unwrap());
+    }
+
+    /// The binding is what the watchdog polls, so it must poll the *bound* key
+    /// rather than whatever it happens to have to hand.
+    #[test]
+    fn the_watchdog_polls_the_bound_virtual_key() {
+        let (mut core, _dir) = bound_core(Mode::PushToTalk);
+        let _ = handle_hook_event(&mut core, &ev(F13, true));
+
+        let seen = std::cell::Cell::new(None);
+        let _ = watchdog_poll(&mut core, |vk| {
+            seen.set(Some(vk));
+            true
+        });
+        assert_eq!(seen.get(), Some(F13));
+    }
+
     #[test]
     fn a_hotkey_press_with_no_working_mic_records_the_error_and_emits() {
         let (mut core, _dir) = bound_core(Mode::PushToTalk);

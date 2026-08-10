@@ -53,3 +53,27 @@ features = [
 [dev-dependencies]
 tempfile = "3"
 
+# DESIGN.md §10.
+#
+# `panic = "abort"` is the one setting here with a behavioural consequence, so
+# it is spelled out rather than left to a reader to infer: on a panic the
+# process dies **without unwinding**, so no `Drop` impl runs. Three components
+# document drop-based cleanup — `hotplug::Registration` (unregisters the
+# `IMMNotificationClient`), `CaptureStream` (releases the WASAPI stream and
+# clears the mic-in-use indicator) and `MicHandle` (joins the audio worker).
+# None of them run on a panic under this profile. That is accepted: every one
+# of those resources is reclaimed by Windows when the process exits, and the
+# drop order they rely on still holds on every ordinary exit path (tray Quit,
+# `WM_ENDSESSION`, window close), which is where it was designed to matter.
+#
+# The cleanup that is **not** merely nice to have is the microphone, and it does
+# not depend on `Drop`: `main.rs` installs a panic hook, panic hooks run before
+# the abort, and `emergency_unmute` restores the mic from there. Verified
+# empirically under this exact profile — see `examples/panic_hook_abort.rs`.
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
+

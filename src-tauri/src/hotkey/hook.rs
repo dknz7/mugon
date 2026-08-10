@@ -108,6 +108,19 @@ pub fn install(tx: Sender<HookEvent>) -> Result<(), String> {
 }
 
 /// Polls the physical state of a key. Backs the stuck-key watchdog (§4.3).
+///
+/// **Reports `false` when it cannot tell, and that is the whole reason §4.3
+/// needs no separate session-lock handler.** `GetAsyncKeyState` is documented
+/// to return zero — not an error — when the current desktop is not the active
+/// desktop, when UIPI blocks access to the foreground thread, or when the
+/// calling thread lacks `DESKTOP_HOOKCONTROL` on the foreground thread's
+/// desktop. A lock screen and a UAC prompt are both desktop switches, and an
+/// elevated foreground window is the UIPI case, so all three of this section's
+/// hazards make this function say "up" and the watchdog re-mute.
+///
+/// Erring towards "up" is the safe direction by design: the cost of being
+/// wrong is a push-to-talk hold that ends early, against a live microphone
+/// nobody can see.
 pub fn is_physically_down(vk: u16) -> bool {
     unsafe { (GetAsyncKeyState(vk as i32) as u16 & 0x8000) != 0 }
 }

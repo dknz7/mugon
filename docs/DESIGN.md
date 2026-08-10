@@ -160,9 +160,33 @@ Mitigations, all required:
 
 1. While PTT is held, a watchdog polls `GetAsyncKeyState` at 250ms. If the key
    reads as physically up, force the release path.
-2. Subscribe to `WM_WTSSESSION_CHANGE`; session lock forces the release path.
+2. ~~Subscribe to `WM_WTSSESSION_CHANGE`; session lock forces the release
+   path.~~ **Resolved at Task 15: not implemented, and not needed.** The
+   documented failure modes of `GetAsyncKeyState` are what make mitigation 1
+   already cover this. It "returns zero if the call fails", and the listed
+   reasons for failure are precisely the three hazards in this section:
+
+   > - The current desktop is not the active desktop.
+   > - UI Privilege Isolation (UIPI) prevents the calling thread from accessing
+   >   the foreground thread.
+   > - The foreground thread belongs to another process and the calling thread
+   >   does not have `DESKTOP_HOOKCONTROL` or `DESKTOP_JOURNALRECORD` access to
+   >   its desktop.
+
+   A locked workstation and a UAC prompt both switch to a different desktop, so
+   the poll returns zero, the key reads as up, and the release fires within
+   250ms — sooner than a session-change message would arrive, and without
+   needing an HWND that the app does not have while the settings window is
+   destroyed (§4.10).
+
+   The watchdog therefore treats "cannot tell" as "physically up". That is the
+   deliberate direction: an unreadable key state re-mutes, which is at worst an
+   interrupted sentence, where the alternative is a live microphone behind a
+   lock screen.
 3. Window focus loss does **not** trigger release — that would break legitimate
-   use, since PTT is used precisely while other apps are focused.
+   use, since PTT is used precisely while other apps are focused. Enforced
+   structurally: `modes::KeyObservation`, the watchdog's only input, has no
+   focus field to consult.
 
 ### 4.4 Hotkey
 
@@ -303,9 +327,24 @@ Toast and beep are independently toggleable.
 
 ### 4.10 Window lifecycle
 
-The close button **destroys the webview** rather than hiding it. Idle tray
-footprint is ~10MB; reopening costs ~300ms of cold start, which is irrelevant for
-a panel opened this rarely.
+The close button **destroys the webview** rather than hiding it. Reopening costs
+a cold start, which is irrelevant for a panel opened this rarely.
+
+**Measured at Task 15** against the installed 0.1.0 release build, whole process
+tree, replacing the original "~10MB idle" estimate:
+
+| State | Processes | Working set | Private bytes |
+|---|---|---|---|
+| Tray only, window never created (the autostart path) | 1 | 15.8 MB | 3.0 MB |
+| Settings window open | 7 (6 × `msedgewebview2.exe`) | 365.5 MB | 189.8 MB |
+| Window destroyed — the idle state | 1 | 28.1 MB | 7.1 MB |
+
+The "~10MB" figure was optimistic on working set and about right on private
+bytes. What matters is the shape, and it holds emphatically: closing the window
+retires all six WebView2 processes and drops the tree from 365 MB to 28 MB.
+Working set does not return all the way to the never-opened figure because
+Windows does not trim a quiet process unless it needs the pages; private bytes,
+the number that reflects what the app is actually holding, goes back to 7.1 MB.
 
 Consequences: the `level` event stream and the WASAPI metering stream both start
 on window create and stop on window destroy, which falls out of this design for

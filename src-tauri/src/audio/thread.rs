@@ -14,6 +14,29 @@
 //!
 //! The worker is generic over [`MicBackend`], so the plumbing is testable
 //! against `fake::FakeMic` with no audio hardware.
+//!
+//! # Drop order is load-bearing on *ordinary* exits only
+//!
+//! Several comments below turn on Rust's drop order — fields in declaration
+//! order, locals in reverse, parameters last — and each of them is genuinely
+//! load-bearing where it stands. But the release profile sets
+//! `panic = "abort"` (DESIGN.md §10), and **an aborting process does not
+//! unwind, so none of these `Drop` impls run on a panic**: not
+//! [`MicHandle::drop`]'s worker join, not [`CaptureStream`]'s stream release,
+//! not [`hotplug::Registration`]'s `UnregisterEndpointNotificationCallback`.
+//!
+//! That is accepted rather than overlooked. Every one of those is a
+//! process-lifetime resource that Windows reclaims when the process dies: COM
+//! registrations go with the apartment, the WASAPI stream goes with the
+//! client, and the worker thread goes with the process. The ordering matters
+//! for tray Quit, `WM_ENDSESSION`, and window close — the paths a user
+//! actually takes — and it holds on all of them.
+//!
+//! The one piece of cleanup that would *not* be reclaimed is a microphone left
+//! muted, and that deliberately does not use `Drop` at all: `main.rs` installs
+//! a panic hook and `crate::emergency_unmute` restores the mic from inside it,
+//! which still runs because hooks execute before the abort. Verified under
+//! this profile by `examples/panic_hook_abort.rs`.
 
 use std::marker::PhantomData;
 use std::sync::mpsc::{self, Receiver, Sender};

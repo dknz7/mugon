@@ -20,6 +20,43 @@ pub enum KeyEdge {
     Up,
 }
 
+/// One poll by the stuck-key watchdog (§4.3), as plain data.
+///
+/// The watchdog exists because the hook can miss a key-up — a UAC prompt
+/// stealing focus, `Win+L`, an elevated window taking the foreground. In Push
+/// to Talk that latches the machine open and leaves the microphone **live**
+/// with nothing to close it. Every other failure in mugon leaves the mic muted;
+/// this is the only one that fails hot, which is why the decision is a pure
+/// function with its own tests rather than three lines inside a thread body.
+///
+/// **There is deliberately no focus field.** §4.3 requires that losing window
+/// focus must *not* release: push-to-talk is used precisely while another
+/// application is focused, so a focus-driven release would break the feature
+/// outright. Leaving focus out of the input type is what makes that structural
+/// rather than a comment someone can later ignore.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KeyObservation {
+    /// Only Push to Talk can latch open — Mute Toggle's `held` flag suppresses
+    /// auto-repeat and never holds the mic live.
+    pub mode: Mode,
+    /// What [`ModeMachine::is_held`] believes.
+    pub held: bool,
+    /// What `GetAsyncKeyState` says about the bound key right now, or `None`
+    /// when there is no binding to poll. `None` is *not* "unknown, leave it
+    /// alone": with no binding, no key-up can ever be matched, so a machine
+    /// that still thinks it is held is stuck by definition and must be
+    /// released.
+    pub physically_down: Option<bool>,
+}
+
+impl KeyObservation {
+    /// §4.3: force the release path when the machine believes the key is held
+    /// but the keyboard disagrees.
+    pub fn release_required(self) -> bool {
+        self.mode == Mode::PushToTalk && self.held && self.physically_down != Some(true)
+    }
+}
+
 /// Sole authority on the microphone's mute state (§3). Owns the `MicControl`
 /// so nothing else can write mute behind its back.
 pub struct ModeMachine<M: MicControl> {
@@ -289,6 +326,77 @@ mod tests {
     fn manual_toggle_works_in_toggle_mode() {
         let mut m = machine(Mode::MuteToggle);
         m.toggle_manual();
+        assert!(m.mic().muted);
+    }
+
+    // --- Stuck-key watchdog decision (§4.3) ---
+
+    fn observed(mode: Mode, held: bool, physically_down: Option<bool>) -> KeyObservation {
+        KeyObservation { mode, held, physically_down }
+    }
+
+    /// The whole reason the watchdog exists: the hook missed the key-up, the
+    /// machine still thinks the key is held, and the mic is live.
+    #[test]
+    fn a_held_ptt_key_that_is_physically_up_must_be_released() {
+        assert!(observed(Mode::PushToTalk, true, Some(false)).release_required());
+    }
+
+    /// The common case, four times a second, for as long as someone talks.
+    #[test]
+    fn a_genuinely_held_ptt_key_must_not_be_released() {
+        assert!(!observed(Mode::PushToTalk, true, Some(true)).release_required());
+    }
+
+    #[test]
+    fn nothing_held_means_nothing_to_release() {
+        assert!(!observed(Mode::PushToTalk, false, Some(false)).release_required());
+        assert!(!observed(Mode::PushToTalk, false, Some(true)).release_required());
+        assert!(!observed(Mode::PushToTalk, false, None).release_required());
+    }
+
+    /// Mute Toggle's `held` only suppresses auto-repeat — it never holds the
+    /// mic live, so the watchdog has no business forcing an edge through it.
+    #[test]
+    fn mute_toggle_is_never_released_by_the_watchdog() {
+        for down in [Some(true), Some(false), None] {
+            assert!(!observed(Mode::MuteToggle, true, down).release_required());
+        }
+    }
+
+    /// Clearing the hotkey mid-hold leaves nothing that can ever match the
+    /// key-up, so the hold would otherwise last until the process exits — with
+    /// the microphone live the entire time.
+    #[test]
+    fn a_hold_with_no_binding_left_to_poll_must_be_released() {
+        assert!(observed(Mode::PushToTalk, true, None).release_required());
+    }
+
+    /// Feeding the forced release back through the machine must settle, or the
+    /// watchdog re-mutes and re-emits four times a second forever.
+    #[test]
+    fn a_forced_release_stops_the_watchdog_asking_again() {
+        let mut m = machine(Mode::PushToTalk);
+        m.on_key(KeyEdge::Down);
+        assert!(observed(m.mode(), m.is_held(), Some(false)).release_required());
+
+        m.on_key(KeyEdge::Up);
+        assert!(m.mic().muted, "the forced release must re-mute");
+        assert!(!observed(m.mode(), m.is_held(), Some(false)).release_required());
+    }
+
+    /// The real key-up usually still arrives after the watchdog has acted (a
+    /// UAC prompt that was dismissed, a lock that was unlocked). It must be a
+    /// no-op rather than a second mute call.
+    #[test]
+    fn the_real_key_up_after_a_forced_release_changes_nothing() {
+        let mut m = machine(Mode::PushToTalk);
+        m.on_key(KeyEdge::Down);
+        m.on_key(KeyEdge::Up); // the watchdog's forced release
+        m.mic_mut().mute_calls.clear();
+
+        m.on_key(KeyEdge::Up); // the hardware's, arriving late
+        assert!(m.mic().mute_calls.is_empty(), "the late key-up must not re-mute");
         assert!(m.mic().muted);
     }
 
