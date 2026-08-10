@@ -723,9 +723,14 @@ mod tests {
         core.hook_error = Some(hook_failure_message("nope"));
         core.last_error = Some("something transient".into());
 
-        // Any successful fallible operation clears `last_error` by design.
-        assert!(core.refresh_mic_health() || true);
-        assert_eq!(core.last_error, None, "sanity: the transient error cleared");
+        // Any successful fallible operation clears `last_error` by design, and
+        // this is the cheapest one. Called purely for that side effect: the
+        // mute state it returns is irrelevant here, and asserting it would tie
+        // a hook-error test to the resting state of an unrelated mode. The
+        // returned value is therefore ignored deliberately, and the assertion
+        // below — which fails if the clear did not happen — is the real check.
+        let _ = core.refresh_mic_health();
+        assert_eq!(core.last_error, None, "the transient error must have cleared");
 
         let snapshot = core.snapshot();
         assert!(
