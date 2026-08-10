@@ -112,9 +112,9 @@ pub fn run() {
         .setup(move |app| {
             let handle = app.handle().clone();
 
-            // Arm the saved binding before the hook goes live, so a hotkey
-            // press during startup is not briefly forwarded to whatever has
-            // focus instead of being swallowed.
+            // Prime `hook::ACTIVE_BINDING` with the saved binding before the
+            // hook goes live, so it reflects the real binding from the first
+            // event onward rather than starting at `None`.
             //
             // `try_state` rather than `state` throughout `setup`: the latter
             // panics when nothing is managed, and no lookup in this function

@@ -189,10 +189,12 @@ Serialized with a human-readable key name rather than a bare virtual-key code.
 
 - Bare single keys are permitted — `F13`, `ScrollLock` and `V` are all legitimate
   PTT bindings.
-- The bound combo is **always swallowed** and not forwarded to the focused
-  application.
+- The bound combo is **shared, not exclusive**: mugon fires on it, and the
+  keystroke still reaches whatever application has focus. mugon never
+  consumes the event to keep it from other applications.
 - If the user binds a bare printable key, the recorder shows a non-blocking
-  warning that typing that character is now intercepted globally. It does not
+  warning: in Push-to-Talk, holding it now repeats that character into
+  whatever is focused — hold `V` to talk and you type `vvvvvvv`. It does not
   prevent the binding.
 - `Esc` alone cannot be bound (reserved for cancel). `Ctrl+Alt+Del` cannot be
   intercepted by any userspace process and is silently unbindable.
@@ -408,7 +410,7 @@ Stated up front, not treated as bugs:
 **Manual test checklist** (Win32 surfaces that cannot be meaningfully automated):
 
 - Mute reflected in Windows Sound settings and in a live call
-- Hotkey fires with the target app focused, and is swallowed
+- Hotkey fires with the target app focused, and the keystroke still reaches it
 - **`F13`–`F24` record, display and fire correctly** — tested from both a
   software remapper (injected input) and firmware remapping if available
 - PTT holds and releases correctly under sustained hold

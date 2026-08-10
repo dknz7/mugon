@@ -93,8 +93,11 @@ pub fn begin_hotkey_recording(app: AppHandle, core: State<Shared>) {
     {
         let mut c = lock_or_recover(&core);
         c.recorder.start();
-        // Stop swallowing while recording, so the user can bind a key that is
-        // currently bound without the old binding eating the press.
+        // Clear the active binding while recording. `handle_hook_event`
+        // (lib.rs) routes to the recorder before it ever checks the bound
+        // combo, so this isn't what makes recording work — but it keeps
+        // `ACTIVE_BINDING` consistent with "no binding is currently armed"
+        // for the duration of the recording.
         crate::hotkey::hook::set_binding(None);
     }
     emit_state(&app);

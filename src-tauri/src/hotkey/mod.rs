@@ -26,10 +26,12 @@ impl Hotkey {
         parts.join(" + ")
     }
 
-    /// True when the binding is a single printable character with no modifiers,
-    /// which globally intercepts that character. Drives the recorder's warning
-    /// (§4.4). F13-F24 are deliberately excluded — they are the recommended
-    /// bare binding.
+    /// True when the binding is a single printable character with no modifiers.
+    /// The hotkey is shared, not exclusive (§4.4), so that character still
+    /// reaches whatever is focused — but in Push-to-Talk, holding it also
+    /// repeats the character for as long as the key is down. Drives the
+    /// recorder's warning. F13-F24 are deliberately excluded — they are the
+    /// recommended bare binding.
     pub fn is_bare_printable(&self) -> bool {
         if self.ctrl || self.alt || self.shift || self.win {
             return false;
@@ -66,10 +68,11 @@ impl<'de> Deserialize<'de> for Hotkey {
         let vk = keys::name_to_vk(&r.key)
             .ok_or_else(|| serde::de::Error::custom(format!("unknown key name {:?}", r.key)))?;
         // A binding's key must never be a modifier (e.g. "LeftCtrl"). The
-        // keyboard hook (hotkey::hook) swallows the physical key its binding
-        // names on every matching press; a modifier-named binding would make
-        // it swallow bare Ctrl/Alt/Shift/Win system-wide, breaking every
-        // other shortcut on the machine. This is the config-file half of
+        // keyboard hook (hotkey::hook) fires the bound action on every
+        // matching press of the physical key its binding names; a
+        // modifier-named binding would fire that action on every bare press
+        // of Ctrl/Alt/Shift/Win system-wide, since those keys are held
+        // constantly for other shortcuts. This is the config-file half of
         // that invariant — `Recorder::feed` (recorder.rs) is the other half,
         // rejecting modifiers as they're pressed during recording. Corrupt
         // or hand-edited config containing a modifier key name must fail to
