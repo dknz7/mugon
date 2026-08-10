@@ -19,8 +19,8 @@ toast and beep feedback, and run-at-login.
 
 ## Install
 
-Download `mugon_0.1.0_x64-setup.exe` and run it. It is a per-user install — no
-elevation, nothing written outside your profile.
+Download `mugon_0.1.0_x64-setup.exe` (1.12 MiB) and run it. It is a per-user
+install — no elevation, nothing written outside your profile.
 
 - Application: `%LOCALAPPDATA%\mugon\`
 - Settings: `%APPDATA%\mugon\config.json`
@@ -37,8 +37,12 @@ closing the settings window destroys it and leaves mugon running in the tray,
 which is what keeps the idle footprint small and Windows' microphone-in-use
 indicator dark.
 
-The mic is restored to unmuted when mugon exits — on Quit, on logoff, on
-shutdown, and even on a crash.
+mugon restores the mic to unmuted on its way out. This is verified for a Rust
+panic — a panic hook unmutes the endpoint before the process dies — and
+implemented, but not end-to-end tested, for tray Quit, logoff and shutdown. The
+one case where it cannot work is a hard kill (Task Manager's "End task"), which
+runs no cleanup code in any application; if that happens, unmute from the
+Windows sound settings.
 
 ---
 
@@ -98,8 +102,15 @@ known than discovered:
    would reduce false positives; it is out of scope for v1. The source is here
    if you would rather build it yourself.
 3. **`Ctrl+Alt+Del` and the secure desktop cannot be intercepted** by any
-   process, mugon included. If your hold is interrupted by one, the stuck-key
-   watchdog re-mutes you within 250ms rather than leaving the mic open.
+   process, mugon included. A push-to-talk hold interrupted by one — or by a UAC
+   prompt or `Win+L` — should be caught by the stuck-key watchdog, which polls
+   the key every 250ms and re-mutes rather than leaving the mic open. That is
+   expected rather than measured: the watchdog is verified against a hold
+   latched open by other means (it recovered in 222ms), and the secure-desktop
+   case rests on `GetAsyncKeyState` being documented to report zero when the
+   active desktop is not ours. It has not been tested against a real lock
+   screen. If you find your mic still live after unlocking, that is a bug worth
+   reporting.
 4. **A portable single-`.exe` cannot toast.** Windows only delivers toast
    notifications for an application with an AppUserModelID backed by a matching
    Start Menu shortcut, and only the installer creates that shortcut. Run the
@@ -118,7 +129,8 @@ npm install
 npx tauri build
 ```
 
-The NSIS installer lands in `src-tauri/target/release/bundle/nsis/`.
+The NSIS installer lands in `src-tauri/target/release/bundle/nsis/`, at roughly
+1.12 MiB for 0.1.0.
 
 For a debug run, `npx tauri dev`. Tests:
 

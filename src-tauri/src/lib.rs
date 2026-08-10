@@ -176,11 +176,12 @@ pub fn run() {
         })
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
-                // §4.10: destroy the webview rather than hiding it, so the idle
-                // tray footprint drops to ~10MB and — the part that is visible
-                // to the user — the capture stream is released and Windows'
-                // microphone-in-use indicator goes out. Quit is only reachable
-                // from the tray.
+                // §4.10: destroy the webview rather than hiding it. That
+                // retires all six `msedgewebview2.exe` processes — measured at
+                // Task 15, the tree drops from ~365MB to ~28MB working set
+                // (~7MB private) — and, the part that is visible to the user,
+                // releases the capture stream so Windows' microphone-in-use
+                // indicator goes out. Quit is only reachable from the tray.
                 api.prevent_close();
                 stop_metering(window.app_handle());
                 let _ = window.destroy();
@@ -419,10 +420,17 @@ fn run_stuck_key_watchdog(app: AppHandle) {
             return;
         };
 
-        let follow = {
+        let (forced, follow) = {
             let mut c = lock_or_recover(&core);
             watchdog_poll(&mut c, hook::is_physically_down)
         };
+
+        // Logged out here rather than inside the poll: everything this module
+        // does under the `Core` lock is deliberate, and a line of I/O that only
+        // exists for diagnostics has no business being the one exception.
+        if forced {
+            eprintln!("mugon: stuck-key watchdog forced the push-to-talk release path (§4.3)");
+        }
         run_follow(&app, follow);
     }
 }
@@ -430,22 +438,27 @@ fn run_stuck_key_watchdog(app: AppHandle) {
 /// One watchdog poll, **under the `Core` lock**, as a function of the state and
 /// a key-state probe.
 ///
+/// Returns whether it forced a release, and the follow-up work. The flag is
+/// separate from the [`Follow`] because it cannot be recovered from it: a
+/// forced release normally reports `MuteChanged`, but degrades to `Emit` when
+/// the endpoint stops answering and to `Nothing` if the mic was somehow already
+/// muted. The caller logs off the flag, outside the lock.
+///
 /// The probe is a parameter rather than a direct `GetAsyncKeyState` call so the
 /// whole poll — decision *and* its effect on the microphone — is testable
 /// against a fake-backed `Core`, which is the point: a watchdog that only fires
 /// in situations nobody can reproduce is a watchdog nobody can trust.
-fn watchdog_poll(c: &mut Core, physically_down: impl Fn(u16) -> bool) -> Follow {
+fn watchdog_poll(c: &mut Core, physically_down: impl Fn(u16) -> bool) -> (bool, Follow) {
     let observation = KeyObservation {
         mode: c.machine.mode(),
         held: c.machine.is_held(),
         physically_down: c.config.hotkey.map(|binding| physically_down(binding.vk)),
     };
     if !observation.release_required() {
-        return Follow::Nothing;
+        return (false, Follow::Nothing);
     }
 
-    eprintln!("mugon: stuck-key watchdog forced the push-to-talk release path (§4.3)");
-    apply_edge(c, KeyEdge::Up)
+    (true, apply_edge(c, KeyEdge::Up))
 }
 
 /// Everything [`dispatch_hook_events`] does **while holding the `Core` lock**,
@@ -638,14 +651,31 @@ mod tests {
         assert_eq!(core.config.hotkey, Some(binding()), "the old binding must survive a cancel");
     }
 
-    /// A dead or absent mic must surface rather than silently doing nothing:
-    /// the read fails, so the change is unknowable and the reason goes to the
-    /// UI.
     // --- Stuck-key watchdog (§4.3) ---
 
     /// Probes that stand in for `GetAsyncKeyState`.
     const KEY_IS_UP: fn(u16) -> bool = |_| false;
     const KEY_IS_DOWN: fn(u16) -> bool = |_| true;
+
+    /// One poll's follow-up, dropping the "did it force a release" flag that
+    /// only the caller's logging needs. `forced_a_release_is_reported`
+    /// covers the flag itself.
+    fn poll(core: &mut Core, probe: impl Fn(u16) -> bool) -> Follow {
+        watchdog_poll(core, probe).1
+    }
+
+    /// The flag exists so the watchdog thread can log outside the `Core` lock,
+    /// and it must not be inferrable from the [`Follow`] — hence its own test.
+    #[test]
+    fn a_forced_release_is_reported_separately_from_its_follow_up() {
+        let (mut core, _dir) = bound_core(Mode::PushToTalk);
+        assert!(!watchdog_poll(&mut core, KEY_IS_UP).0, "nothing held: nothing forced");
+
+        let _ = handle_hook_event(&mut core, &ev(F13, true));
+        assert!(!watchdog_poll(&mut core, KEY_IS_DOWN).0, "a real hold forces nothing");
+        assert!(watchdog_poll(&mut core, KEY_IS_UP).0, "a stuck key must report the release");
+        assert!(!watchdog_poll(&mut core, KEY_IS_UP).0, "and only once");
+    }
 
     /// The failure this whole feature exists for: PTT held, the key-up lost to
     /// a UAC prompt, and the microphone live with nothing to close it.
@@ -655,7 +685,7 @@ mod tests {
         let _ = handle_hook_event(&mut core, &ev(F13, true));
         assert!(!core.machine.mic().is_muted().unwrap(), "sanity: the hold went live");
 
-        match watchdog_poll(&mut core, KEY_IS_UP) {
+        match poll(&mut core, KEY_IS_UP) {
             Follow::MuteChanged { mode, muted, .. } => {
                 assert_eq!(mode, Mode::PushToTalk);
                 assert!(muted, "the forced release must report the mic going quiet");
@@ -674,7 +704,7 @@ mod tests {
         let _ = handle_hook_event(&mut core, &ev(F13, true));
 
         for _ in 0..8 {
-            assert!(matches!(watchdog_poll(&mut core, KEY_IS_DOWN), Follow::Nothing));
+            assert!(matches!(poll(&mut core, KEY_IS_DOWN), Follow::Nothing));
         }
         assert!(!core.machine.mic().is_muted().unwrap(), "a real hold must stay live");
         assert!(core.machine.is_held());
@@ -683,7 +713,7 @@ mod tests {
     #[test]
     fn the_watchdog_is_silent_when_nothing_is_held() {
         let (mut core, _dir) = bound_core(Mode::PushToTalk);
-        assert!(matches!(watchdog_poll(&mut core, KEY_IS_UP), Follow::Nothing));
+        assert!(matches!(poll(&mut core, KEY_IS_UP), Follow::Nothing));
         assert!(core.machine.mic().is_muted().unwrap(), "PTT rests muted, untouched");
     }
 
@@ -695,7 +725,7 @@ mod tests {
         let _ = handle_hook_event(&mut core, &ev(F13, true));
         let muted = core.machine.mic().is_muted().unwrap();
 
-        assert!(matches!(watchdog_poll(&mut core, KEY_IS_UP), Follow::Nothing));
+        assert!(matches!(poll(&mut core, KEY_IS_UP), Follow::Nothing));
         assert_eq!(core.machine.mic().is_muted().unwrap(), muted, "the mic must not move");
     }
 
@@ -707,7 +737,7 @@ mod tests {
         let _ = handle_hook_event(&mut core, &ev(F13, true));
         core.config.hotkey = None;
 
-        assert!(matches!(watchdog_poll(&mut core, KEY_IS_DOWN), Follow::MuteChanged { muted: true, .. }));
+        assert!(matches!(poll(&mut core, KEY_IS_DOWN), Follow::MuteChanged { muted: true, .. }));
         assert!(core.machine.mic().is_muted().unwrap());
     }
 
@@ -718,9 +748,9 @@ mod tests {
         let (mut core, _dir) = bound_core(Mode::PushToTalk);
         let _ = handle_hook_event(&mut core, &ev(F13, true));
 
-        assert!(matches!(watchdog_poll(&mut core, KEY_IS_UP), Follow::MuteChanged { .. }));
+        assert!(matches!(poll(&mut core, KEY_IS_UP), Follow::MuteChanged { .. }));
         for _ in 0..4 {
-            assert!(matches!(watchdog_poll(&mut core, KEY_IS_UP), Follow::Nothing));
+            assert!(matches!(poll(&mut core, KEY_IS_UP), Follow::Nothing));
         }
     }
 
@@ -731,7 +761,7 @@ mod tests {
     fn a_late_real_key_up_after_a_forced_release_is_a_noop() {
         let (mut core, _dir) = bound_core(Mode::PushToTalk);
         let _ = handle_hook_event(&mut core, &ev(F13, true));
-        let _ = watchdog_poll(&mut core, KEY_IS_UP);
+        let _ = poll(&mut core, KEY_IS_UP);
 
         assert!(matches!(handle_hook_event(&mut core, &ev(F13, false)), Follow::Nothing));
         assert!(core.machine.mic().is_muted().unwrap());
@@ -745,13 +775,16 @@ mod tests {
         let _ = handle_hook_event(&mut core, &ev(F13, true));
 
         let seen = std::cell::Cell::new(None);
-        let _ = watchdog_poll(&mut core, |vk| {
+        let _ = poll(&mut core, |vk| {
             seen.set(Some(vk));
             true
         });
         assert_eq!(seen.get(), Some(F13));
     }
 
+    /// A dead or absent mic must surface rather than silently doing nothing:
+    /// the read fails, so the change is unknowable and the reason goes to the
+    /// UI.
     #[test]
     fn a_hotkey_press_with_no_working_mic_records_the_error_and_emits() {
         let (mut core, _dir) = bound_core(Mode::PushToTalk);
