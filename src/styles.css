@@ -299,6 +299,14 @@ body::before {
   color: var(--text-dim);
   font-size: 12px;
   line-height: 1.4;
+  /* Real COM error strings run long; the 460x700 window has no scroll
+     fallback and #settings-cog is the only way out of the settings sheet, so
+     an unbounded banner clipping it off-screen would strand the user with no
+     visible symptom (task-14-amendment.md §4). A hard 2-line clip (box-sizing
+     is border-box, so this height includes the 9px top/bottom padding) is
+     simpler and more reliably clipped across engines than -webkit-line-clamp. */
+  max-height: 54px; /* one line + the "LAST PROBLEM" label, Task 13's original budget */
+  overflow: hidden;
 }
 
 /* Past tense, by construction. A ::before rather than a child element so
