@@ -93,12 +93,6 @@ pub fn begin_hotkey_recording(app: AppHandle, core: State<Shared>) {
     {
         let mut c = lock_or_recover(&core);
         c.recorder.start();
-        // Clear the active binding while recording. `handle_hook_event`
-        // (lib.rs) routes to the recorder before it ever checks the bound
-        // combo, so this isn't what makes recording work — but it keeps
-        // `ACTIVE_BINDING` consistent with "no binding is currently armed"
-        // for the duration of the recording.
-        crate::hotkey::hook::set_binding(None);
     }
     emit_state(&app);
 }
@@ -108,7 +102,6 @@ pub fn cancel_hotkey_recording(app: AppHandle, core: State<Shared>) {
     {
         let mut c = lock_or_recover(&core);
         c.recorder.cancel();
-        crate::hotkey::hook::set_binding(c.config.hotkey);
     }
     emit_state(&app);
 }
@@ -119,7 +112,6 @@ pub fn clear_hotkey(app: AppHandle, core: State<Shared>) {
         let mut c = lock_or_recover(&core);
         c.config.hotkey = None;
         c.persist();
-        crate::hotkey::hook::set_binding(None);
     }
     emit_state(&app);
 }

@@ -210,7 +210,7 @@ subset. Specifically required:
 | **Extended function keys** | **`VK_F13`–`VK_F24`** | **Hard requirement.** Immediately follows `F12` in the VK space. |
 | Alphanumerics | `A`–`Z`, `0`–`9` | Triggers the bare-printable-key warning |
 | Numpad | `VK_NUMPAD0`–`9`, operators | Distinct from the number row |
-| Lock keys | `CapsLock`, `ScrollLock`, `NumLock` | Safe to bind — because the hotkey is always swallowed, the lock state does not toggle when used as a binding |
+| Lock keys | `CapsLock`, `ScrollLock`, `NumLock` | Bindable. Pressing them toggles the lock, same as any other bound key toggling anything else it's normally bound to. |
 | Navigation / editing | Arrows, `Home`/`End`/`PgUp`/`PgDn`, `Ins`/`Del` | — |
 | Media & browser keys | `VK_MEDIA_*`, `VK_BROWSER_*`, `VK_VOLUME_*` | Delivered by the keyboard hook |
 

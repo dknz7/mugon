@@ -112,18 +112,6 @@ pub fn run() {
         .setup(move |app| {
             let handle = app.handle().clone();
 
-            // Prime `hook::ACTIVE_BINDING` with the saved binding before the
-            // hook goes live, so it reflects the real binding from the first
-            // event onward rather than starting at `None`.
-            //
-            // `try_state` rather than `state` throughout `setup`: the latter
-            // panics when nothing is managed, and no lookup in this function
-            // has a recovery worth panicking over.
-            let binding = app
-                .try_state::<Shared>()
-                .and_then(|core| lock_or_recover(&core).config.hotkey);
-            hook::set_binding(binding);
-
             // §4.10: metering is a property of the *window*, not of the
             // process. `tauri.conf.json` declares no window
             // (`"windows": []`), so nothing exists yet — `tray::show_window`
@@ -389,13 +377,9 @@ fn handle_hook_event(c: &mut Core, ev: &HookEvent) -> Follow {
             RecorderOutcome::Committed(hk) => {
                 c.config.hotkey = Some(hk);
                 c.persist();
-                hook::set_binding(Some(hk));
                 Follow::Emit
             }
-            RecorderOutcome::Cancelled => {
-                hook::set_binding(c.config.hotkey);
-                Follow::Emit
-            }
+            RecorderOutcome::Cancelled => Follow::Emit,
             RecorderOutcome::InProgress(partial) => Follow::Recording(partial.map(|h| h.display())),
             RecorderOutcome::Idle => Follow::Nothing,
         };

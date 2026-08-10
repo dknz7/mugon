@@ -6,7 +6,7 @@
 
 use super::Hotkey;
 use std::sync::mpsc::Sender;
-use std::sync::{Mutex, OnceLock};
+use std::sync::OnceLock;
 use windows::Win32::Foundation::{LPARAM, LRESULT, WPARAM};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetAsyncKeyState, VK_LMENU, VK_LWIN, VK_MENU, VK_RMENU, VK_RWIN, VK_SHIFT, VK_CONTROL,
@@ -26,32 +26,7 @@ pub struct HookEvent {
     pub win: bool,
 }
 
-/// The current hotkey binding, mirrored here from `Core::config.hotkey` by
-/// every call to [`set_binding`]. Task 14c (the exclusive-to-shared reversal,
-/// DESIGN.md §4.4) removed `hook_proc`'s only read of this value — it used
-/// to decide whether to swallow a key-down, which the hook no longer does.
-/// Nothing in this module reads it anymore; `lib.rs::handle_hook_event`
-/// matches against `Core::config.hotkey` directly instead. Left in place
-/// rather than deleted: removing it means touching every `set_binding` call
-/// site (`commands.rs`, `lib.rs`), which is out of scope for this task. Flagged
-/// for a follow-up cleanup.
-static ACTIVE_BINDING: OnceLock<Mutex<Option<Hotkey>>> = OnceLock::new();
 static SENDER: OnceLock<Sender<HookEvent>> = OnceLock::new();
-
-fn binding_slot() -> &'static Mutex<Option<Hotkey>> {
-    ACTIVE_BINDING.get_or_init(|| Mutex::new(None))
-}
-
-/// Records the current hotkey binding. `None` while the recorder is active,
-/// and when the user clears the hotkey.
-pub fn set_binding(hk: Option<Hotkey>) {
-    // Recovers a poisoned lock rather than propagating the panic: the
-    // protected value is a plain `Option<Hotkey>` with no invariant a panic
-    // mid-write could leave broken, and a panic unwinding out of `hook_proc`
-    // (an `extern "system"` callback invoked by Windows) would be undefined
-    // behaviour. See the identical rationale on every other lock site below.
-    *binding_slot().lock().unwrap_or_else(|e| e.into_inner()) = hk;
-}
 
 /// True when the event exactly matches the binding — same key, and the modifier
 /// set matches precisely. A superset must not fire, so Ctrl+Alt+M does not

@@ -123,8 +123,10 @@ mod tests {
     fn deserializing_a_modifier_key_name_fails() {
         // A hand-edited or corrupted config naming a modifier as the bound key
         // (e.g. "LeftCtrl") must not deserialize into a Hotkey: the keyboard
-        // hook would swallow that modifier system-wide. Config::load's
-        // fallback-to-defaults-on-error path handles the failure safely.
+        // hook would fire the bound action on every bare press of that
+        // modifier system-wide, since modifiers are held constantly for
+        // other shortcuts. Config::load's fallback-to-defaults-on-error path
+        // handles the failure safely.
         let json = r#"{"ctrl":false,"alt":false,"shift":false,"win":false,"key":"LeftCtrl"}"#;
         assert!(serde_json::from_str::<Hotkey>(json).is_err());
     }
