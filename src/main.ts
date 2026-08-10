@@ -131,6 +131,15 @@ function refreshDevices(selected: string | null) {
 }
 
 function render(s: AppState) {
+  // The live combo belongs to *this* recording session and nothing else.
+  // Without this the previous session's combo survives, so re-entering
+  // recording shows the last key the user pressed instead of "Press a key…",
+  // which reads as a hotkey that is already bound and does nothing. Cleared
+  // here rather than on the Record click because a recording can also end via
+  // Escape, the Cancel button, or a commit — `recording` going false is the
+  // one condition common to all of them.
+  if (!s.recording) recordingCombo = null;
+
   setHeroMuted(els.hero, s.muted);
 
   renderDeviceOptions(s.selected_device);
