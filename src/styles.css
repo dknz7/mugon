@@ -323,6 +323,13 @@ body::before {
   opacity: 0.85;
 }
 
+/* A hook that would not install is not a past problem — it is the current,
+   permanent state of the session, and "Last problem" reads as though it has
+   already passed. Same banner, honest label. */
+.banner--hook::before {
+  content: "Hotkey disabled";
+}
+
 /* ------------------------------------------------------------ controls -- */
 
 .select-wrap {

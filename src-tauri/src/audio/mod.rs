@@ -53,8 +53,11 @@ pub struct DeviceInfo {
 /// `MicControl` is [`MicBackend`] **plus the promise that the implementor can
 /// cross a thread boundary**, and nothing else — it declares no methods of its
 /// own. The blanket impl below means every `Send` backend is automatically a
-/// `MicControl`, so each backend writes its seven method bodies exactly once and
-/// there is no forwarding boilerplate anywhere in the tree.
+/// `MicControl`, so no type ever writes a second set of method bodies just to
+/// satisfy this trait. (Forwarding does exist where a type genuinely wraps
+/// another — `MtaEndpoint` over `Endpoint`, `state::Mic` over `MicHandle` —
+/// but that is delegation between two different backends, not boilerplate
+/// this trait imposes.)
 ///
 /// The invariant this whole layer exists to enforce falls straight out of the
 /// bound: `Endpoint` is a `MicBackend` but is not `Send`, so it can never be a

@@ -151,8 +151,8 @@ fn set_mode(app: &AppHandle, mode: Mode) {
 /// where it does anything (§4.1).
 ///
 /// `pub(crate)` because the mode can also change from the IPC surface, and a
-/// tray menu still showing the old mode is a lie the user acts on. Nothing
-/// calls it from there yet — the frontend that would is Tasks 13–14.
+/// tray menu still showing the old mode is a lie the user acts on —
+/// `commands::set_mode` calls it for exactly that reason.
 pub(crate) fn sync_menu(app: &AppHandle, mode: Mode) {
     let Some(menu) = app.try_state::<TrayMenu>() else {
         return;

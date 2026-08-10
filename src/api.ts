@@ -31,6 +31,15 @@ export interface AppState {
   autostart: boolean;
   recording: boolean;
   last_error: string | null;
+  /**
+   * Why the keyboard hook is not running, or `null` while it is.
+   *
+   * Separate from `last_error` on purpose: that one clears on the next
+   * successful audio call, and a dead hook is a standing condition — the
+   * hotkey does nothing until the app is restarted. Rendered in the same
+   * banner, with precedence.
+   */
+  hook_error: string | null;
 }
 
 export const api = {

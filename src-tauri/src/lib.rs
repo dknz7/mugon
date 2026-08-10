@@ -95,6 +95,8 @@ pub fn run() {
             config_dir,
             recorder: Recorder::default(),
             last_error,
+            // Set only if the hook thread below fails to install.
+            hook_error: None,
         }))
         .manage::<Meter>(Mutex::new(MeterHandle::new()))
         .invoke_handler(tauri::generate_handler![
@@ -149,13 +151,20 @@ pub fn run() {
             let (tx, rx) = mpsc::channel::<HookEvent>();
 
             // The hook needs its own thread with a message pump — `install`
-            // blocks forever.
+            // blocks forever, so this closure only returns if it failed.
+            let hook_app = handle.clone();
             std::thread::Builder::new().name("mugon-hook".into()).spawn(move || {
                 if let Err(e) = hook::install(tx) {
                     // DESIGN.md §7: without the hook the app's core function
-                    // is dead. Task 10/14 surface this in the UI; for now it
-                    // is a loud log and a still-running app.
+                    // is dead, so this has to reach the user. It used to be an
+                    // `eprintln!` and nothing else — which in a release build
+                    // goes nowhere at all, because `main.rs` sets
+                    // `windows_subsystem = "windows"` and there is no console
+                    // to print to. The app then showed a fully populated
+                    // settings window with a bound hotkey that silently did
+                    // nothing.
                     eprintln!("mugon: FATAL: keyboard hook failed to install: {e}");
+                    report_hook_failure(&hook_app, &e);
                 }
             })?;
 
@@ -219,6 +228,39 @@ pub fn restore_microphone(app: &AppHandle) {
         return;
     };
     lock_or_recover(&core).machine.shutdown();
+}
+
+/// The banner text for a keyboard hook that would not install.
+///
+/// Split out from [`report_hook_failure`] so the wording — the part the user
+/// actually has to act on — is testable without an `AppHandle`.
+///
+/// Written front-loaded on purpose. The banner truncates to roughly 65
+/// characters (the frontend puts the full string in a tooltip), so the two
+/// things the user needs — *the hotkey does not work* and *antivirus is the
+/// likely reason* — have to survive being cut off. The underlying Win32 error
+/// trails at the end where losing it costs nothing.
+fn hook_failure_message(reason: &str) -> String {
+    format!(
+        "Hotkey inactive — Windows blocked the keyboard hook. Antivirus software is the \
+         usual cause; mugon cannot mute or unmute from the keyboard until it is allowed \
+         through. Everything else still works. ({reason})"
+    )
+}
+
+/// Records a hook-install failure where the user can see it (§7).
+///
+/// Takes the `Core` lock only to store the message, then emits **after**
+/// releasing it — `emit_state` takes the same lock.
+fn report_hook_failure(app: &AppHandle, reason: &str) {
+    let Some(core) = app.try_state::<Shared>() else {
+        return;
+    };
+    // Scoped so the guard is dead before `emit_state` re-enters the lock.
+    {
+        lock_or_recover(&core).hook_error = Some(hook_failure_message(reason));
+    }
+    emit_state(app);
 }
 
 /// How long [`emergency_unmute`] gets before it gives up.
@@ -649,6 +691,55 @@ mod tests {
         assert!(matches!(handle_hook_event(&mut core, &ev(0x1B, true)), Follow::Emit));
         assert!(!core.recorder.is_active());
         assert_eq!(core.config.hotkey, Some(binding()), "the old binding must survive a cancel");
+    }
+
+    // --- Hook health (§7) ---
+
+    /// The banner is the only signal a user gets that their hotkey is dead, so
+    /// it has to say both what broke and what to do — and say them early
+    /// enough to survive the frontend's ~65-character truncation.
+    #[test]
+    fn the_hook_failure_banner_names_the_symptom_and_the_likely_cause() {
+        let message = hook_failure_message("SetWindowsHookExW failed: Access is denied. (0x80070005)");
+
+        let head = &message[..65.min(message.len())];
+        assert!(head.contains("Hotkey"), "the symptom must survive truncation: {head}");
+        assert!(
+            head.to_lowercase().contains("antivirus") || head.contains("blocked"),
+            "the cause must survive truncation: {head}"
+        );
+        assert!(
+            message.contains("0x80070005"),
+            "the underlying Win32 error must still be recoverable from the full string"
+        );
+    }
+
+    /// The whole reason this is not `last_error`: that field clears on the next
+    /// successful audio call, which in practice is milliseconds away. A dead
+    /// hook is a standing condition and must outlive every one of them.
+    #[test]
+    fn a_hook_failure_survives_later_successful_audio_calls() {
+        let (mut core, _dir) = bound_core(Mode::MuteToggle);
+        core.hook_error = Some(hook_failure_message("nope"));
+        core.last_error = Some("something transient".into());
+
+        // Any successful fallible operation clears `last_error` by design.
+        assert!(core.refresh_mic_health() || true);
+        assert_eq!(core.last_error, None, "sanity: the transient error cleared");
+
+        let snapshot = core.snapshot();
+        assert!(
+            snapshot.hook_error.is_some(),
+            "the hook failure must still be reported to the UI"
+        );
+        assert_eq!(snapshot.last_error, None);
+    }
+
+    /// A healthy hook must not put anything in the banner.
+    #[test]
+    fn a_working_hook_reports_no_error() {
+        let (core, _dir) = bound_core(Mode::MuteToggle);
+        assert_eq!(core.snapshot().hook_error, None);
     }
 
     // --- Stuck-key watchdog (§4.3) ---

@@ -175,9 +175,10 @@ impl Endpoint {
     /// Re-resolves `selected_id` to a live device. Called after a hotplug event
     /// and whenever the default device changes.
     ///
-    /// Also the entry point the later `IMMNotificationClient` task will call
-    /// from its device-change callback; that callback needs an `AppHandle`
-    /// which does not exist yet, so for now `select` is the only caller.
+    /// Two callers: [`Self::select`], which re-resolves as part of pointing at
+    /// a new device, and the `IMMNotificationClient` device-change callback
+    /// (§4.5), which reaches it through `Command::DeviceChanged` on the audio
+    /// worker.
     pub fn refresh(&mut self) -> Result<(), AudioError> {
         unsafe {
             let device = match &self.selected_id {

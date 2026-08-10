@@ -193,6 +193,23 @@ pub struct AppState {
     /// timestamp. Task 14 should render it as "the last thing that went wrong",
     /// not as "something is wrong right now".
     pub last_error: Option<String>,
+    /// Why the keyboard hook is not running, or `None` while it is.
+    ///
+    /// **Deliberately not folded into [`Self::last_error`]**, though it is also
+    /// an error string. The two have opposite lifetimes: `last_error` is "the
+    /// last thing that went wrong" and clears on the next successful audio
+    /// call, whereas a hook that failed to install is a *standing condition*
+    /// that nothing in the app can recover from. Routed through `last_error`
+    /// it would be wiped by the very next mute read — a few hundred
+    /// milliseconds later — and the user would be left with a fully populated
+    /// settings window, a bound hotkey, and no indication whatsoever that the
+    /// hotkey does nothing.
+    ///
+    /// DESIGN.md §7 calls for a blocking error in the UI here, because without
+    /// the hook the app's core function is dead. Tasks 10 and 14 each recorded
+    /// that the other would surface it; neither did, and it went unreported
+    /// until the whole-branch review.
+    pub hook_error: Option<String>,
 }
 
 pub struct Core {
@@ -206,6 +223,10 @@ pub struct Core {
     pub recorder: Recorder,
     /// See [`AppState::last_error`] for the dismissal semantics.
     pub last_error: Option<String>,
+    /// See [`AppState::hook_error`]. Set once, by the hook thread, if
+    /// `SetWindowsHookExW` fails; never cleared, because nothing can undo it
+    /// short of a restart.
+    pub hook_error: Option<String>,
 }
 
 impl Core {
@@ -234,6 +255,7 @@ impl Core {
             autostart: self.config.autostart,
             recording: self.recorder.is_active(),
             last_error: self.last_error.clone(),
+            hook_error: self.hook_error.clone(),
         }
     }
 
@@ -443,6 +465,7 @@ pub(crate) fn fake_core(mode: Mode) -> (Core, tempfile::TempDir) {
         config_dir: dir.path().to_path_buf(),
         recorder: Recorder::default(),
         last_error: None,
+        hook_error: None,
     };
     (core, dir)
 }
@@ -459,6 +482,7 @@ mod tests {
             config_dir: std::env::temp_dir().join("mugon-test-never-written"),
             recorder: Recorder::default(),
             last_error: None,
+            hook_error: None,
         }
     }
 
@@ -476,6 +500,7 @@ mod tests {
             keys,
             [
                 "autostart",
+                "hook_error",
                 "hotkey_display",
                 "hotkey_is_bare_printable",
                 "last_error",

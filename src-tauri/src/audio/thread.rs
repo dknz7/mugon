@@ -218,8 +218,9 @@ pub(crate) trait DeviceRefresh {
 }
 
 impl DeviceRefresh for MtaEndpoint {
-    /// The first and only caller [`Endpoint::refresh`] has ever had — it was
-    /// built for this in Task 5 and has been waiting since.
+    /// The hotplug path's route into [`Endpoint::refresh`], reached from
+    /// `Command::DeviceChanged`. `Endpoint::select` calls `refresh` too, as
+    /// part of re-pointing at a new device.
     fn refresh(&mut self) -> Result<(), AudioError> {
         self.endpoint.refresh()
     }
@@ -354,6 +355,14 @@ pub struct MicHandle {
     /// down. [`MicHandle::drop`] waits on it with a bound, which a bare
     /// `JoinHandle::join` cannot offer.
     done: Receiver<()>,
+    /// Always [`COMMAND_TIMEOUT`] in production. A field rather than a direct
+    /// use of the constant so the two tests that must actually *wait out* the
+    /// bound can set it to milliseconds: asserting the timeout fires is worth
+    /// a test, but spending five real seconds per assertion to do it made the
+    /// entire suite five seconds long. `command_timeout_is_five_seconds` pins
+    /// the production value separately, so shrinking it here cannot hide a
+    /// change to the real bound.
+    timeout: Duration,
 }
 
 /// Task 9 puts `MicHandle` in a Tauri-managed `Mutex` that must be `Send + Sync`
@@ -393,6 +402,21 @@ impl MicHandle {
         B: MicBackend + MeterCapture + DeviceRefresh + 'static,
         F: FnOnce() -> Result<B, AudioError> + Send + 'static,
     {
+        Self::spawn_bounded(COMMAND_TIMEOUT, make)
+    }
+
+    /// [`Self::spawn_with`] with the command bound chosen by the caller.
+    ///
+    /// Exists for the two tests that assert the timeout actually fires, which
+    /// have to *wait it out* to do so. At the production five seconds that was
+    /// the entire runtime of the test suite; at milliseconds the same
+    /// assertions cost nothing and `command_timeout_is_five_seconds` pins the
+    /// real value so the shortcut cannot mask a change to it.
+    pub(crate) fn spawn_bounded<B, F>(timeout: Duration, make: F) -> Result<Self, AudioError>
+    where
+        B: MicBackend + MeterCapture + DeviceRefresh + 'static,
+        F: FnOnce() -> Result<B, AudioError> + Send + 'static,
+    {
         let (tx, rx) = mpsc::channel::<Command>();
         let (ready_tx, ready_rx) = mpsc::channel::<Result<(), AudioError>>();
         let (done_tx, done_rx) = mpsc::channel::<()>();
@@ -405,7 +429,7 @@ impl MicHandle {
         // A `RecvError` here means the worker died without reporting, which is
         // still a startup failure — never an unwrap.
         match ready_rx.recv() {
-            Ok(Ok(())) => Ok(Self { tx, join: Some(join), done: done_rx }),
+            Ok(Ok(())) => Ok(Self { tx, join: Some(join), done: done_rx, timeout }),
             Ok(Err(e)) => {
                 let _ = join.join();
                 Err(e)
@@ -428,17 +452,16 @@ impl MicHandle {
         &self,
         build: impl FnOnce(Sender<Result<T, AudioError>>) -> Command,
     ) -> Result<T, AudioError> {
-        send_command(&self.tx, build)
+        send_command(&self.tx, self.timeout, build)
     }
 
     /// A cheap, cloneable, read-only view onto this worker's metering
     /// capability. Used by the level meter (`meter::MeterHandle`), which must
     /// be able to hand out its own clones without going anywhere near
-    /// `MicHandle`'s single-ownership `Drop`. `MicHandle` itself has no
-    /// metering methods of its own — see [`MeterTap`]'s docs for why the
-    /// capture stream needs exactly one owner.
+    /// `MicHandle`'s single-ownership `Drop`. See [`MeterTap`]'s docs for why
+    /// the capture stream needs exactly one owner.
     pub fn tap(&self) -> MeterTap {
-        MeterTap { tx: self.tx.clone() }
+        MeterTap { tx: self.tx.clone(), timeout: self.timeout }
     }
 
     /// Starts listening for capture-device arrivals, departures and
@@ -496,22 +519,22 @@ pub const COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
 /// for them to hold everywhere.
 fn send_command<T>(
     tx: &Sender<Command>,
+    timeout: Duration,
     build: impl FnOnce(Sender<Result<T, AudioError>>) -> Command,
 ) -> Result<T, AudioError> {
     let (reply_tx, reply_rx) = mpsc::channel();
     tx.send(build(reply_tx)).map_err(|_| worker_gone())?;
-    match reply_rx.recv_timeout(COMMAND_TIMEOUT) {
+    match reply_rx.recv_timeout(timeout) {
         Ok(result) => result,
-        Err(mpsc::RecvTimeoutError::Timeout) => Err(AudioError::Timeout(COMMAND_TIMEOUT)),
+        Err(mpsc::RecvTimeoutError::Timeout) => Err(AudioError::Timeout(timeout)),
         Err(mpsc::RecvTimeoutError::Disconnected) => Err(worker_gone()),
     }
 }
 
 /// The audio worker's *metering* capability: observe levels and control the
-/// capture stream that keeps them live. Nothing more — it cannot mute,
-/// unmute, set volume, or select a device, and there is no exception clause
-/// to that: those four are the only things `MicBackend` exposes that are not
-/// reachable through this type.
+/// capture stream that keeps them live. Nothing more — it cannot mute, unmute,
+/// read mute, set or read volume, or select a device, and there is no
+/// exception clause to that.
 ///
 /// Holds only a command sender, so it is cheap to clone and `Send` falls out
 /// of its field types — see the compile-time assertion below.
@@ -525,6 +548,8 @@ fn send_command<T>(
 #[derive(Clone)]
 pub struct MeterTap {
     tx: Sender<Command>,
+    /// Inherited from the [`MicHandle`] that produced it — see its `timeout`.
+    timeout: Duration,
 }
 
 const _: fn() = || {
@@ -538,7 +563,7 @@ impl MeterTap {
     /// Same call/reply shape as every `MicHandle` method — funnelled through
     /// the same [`send_command`] helper, not a second copy of it.
     pub fn peak(&self) -> Result<f32, AudioError> {
-        send_command(&self.tx, Command::Peak)
+        send_command(&self.tx, self.timeout, Command::Peak)
     }
 
     /// Opens the worker's capture stream if one is not already open, so the
@@ -546,12 +571,12 @@ impl MeterTap {
     /// [`CaptureStream`] for why. Idempotent, and a failure here is never
     /// fatal to the caller — it degrades to passive polling.
     pub fn start_metering(&self) -> Result<(), AudioError> {
-        send_command(&self.tx, Command::StartMetering)
+        send_command(&self.tx, self.timeout, Command::StartMetering)
     }
 
     /// Drops the worker's capture stream, if any. Idempotent.
     pub fn stop_metering(&self) -> Result<(), AudioError> {
-        send_command(&self.tx, Command::StopMetering)
+        send_command(&self.tx, self.timeout, Command::StopMetering)
     }
 }
 
@@ -606,7 +631,7 @@ impl Drop for MicHandle {
 
         // `Ok`/`Disconnected` both mean "finished"; only `Timeout` is failure.
         let wedged = matches!(
-            self.done.recv_timeout(COMMAND_TIMEOUT),
+            self.done.recv_timeout(self.timeout),
             Err(mpsc::RecvTimeoutError::Timeout)
         );
 
@@ -616,8 +641,9 @@ impl Drop for MicHandle {
                 let _ = join.join();
             }
             Some(_detached) => eprintln!(
-                "mugon: the audio worker did not shut down within {COMMAND_TIMEOUT:?}; \
-                 detaching it so the process can exit"
+                "mugon: the audio worker did not shut down within {:?}; \
+                 detaching it so the process can exit",
+                self.timeout
             ),
             None => {}
         }
@@ -1229,6 +1255,20 @@ mod tests {
 
     impl DeviceRefresh for WedgedFake {}
 
+    /// The bound these two tests wait out. Production is
+    /// [`COMMAND_TIMEOUT`] — five seconds — and waiting that out twice *was*
+    /// the runtime of the whole suite. What is under test is that the bound is
+    /// enforced at all, which does not depend on its length;
+    /// `command_timeout_is_five_seconds` pins the real value.
+    const TEST_TIMEOUT: Duration = Duration::from_millis(100);
+
+    /// The production bound, asserted on its own so the millisecond timeout
+    /// the two tests below use cannot quietly become the shipped one.
+    #[test]
+    fn command_timeout_is_five_seconds() {
+        assert_eq!(COMMAND_TIMEOUT, Duration::from_secs(5));
+    }
+
     /// The property: a caller waiting on a worker that never replies gets an
     /// error, not a permanent block. Without the bound this test would hang
     /// the suite — which is exactly what it would do to the UI thread, while
@@ -1236,18 +1276,20 @@ mod tests {
     #[test]
     fn a_wedged_worker_times_out_instead_of_blocking_the_caller_forever() {
         let (release_tx, release_rx) = mpsc::channel::<()>();
-        let mic =
-            MicHandle::spawn_with(move || Ok(WedgedFake { release: release_rx })).expect("must spawn");
+        let mic = MicHandle::spawn_bounded(TEST_TIMEOUT, move || {
+            Ok(WedgedFake { release: release_rx })
+        })
+        .expect("must spawn");
 
         let started = std::time::Instant::now();
         let result = mic.is_muted();
         let elapsed = started.elapsed();
 
         match result {
-            Err(AudioError::Timeout(bound)) => assert_eq!(bound, COMMAND_TIMEOUT),
+            Err(AudioError::Timeout(bound)) => assert_eq!(bound, TEST_TIMEOUT),
             other => panic!("expected a timeout, got {other:?}"),
         }
-        assert!(elapsed >= COMMAND_TIMEOUT, "returned before the bound elapsed: {elapsed:?}");
+        assert!(elapsed >= TEST_TIMEOUT, "returned before the bound elapsed: {elapsed:?}");
 
         // Let the worker out before dropping the handle: `MicHandle::drop`
         // joins the thread, so a still-wedged worker would hang this test
@@ -1268,8 +1310,10 @@ mod tests {
     #[test]
     fn dropping_a_handle_whose_worker_is_wedged_detaches_instead_of_hanging() {
         let (release_tx, release_rx) = mpsc::channel::<()>();
-        let mic = MicHandle::spawn_with(move || Ok(WedgedFake { release: release_rx }))
-            .expect("must spawn");
+        let mic = MicHandle::spawn_bounded(TEST_TIMEOUT, move || {
+            Ok(WedgedFake { release: release_rx })
+        })
+        .expect("must spawn");
 
         // Wedge the worker through a tap, so the handle itself stays droppable.
         let tap = mic.tap();
@@ -1278,8 +1322,9 @@ mod tests {
         });
         // Long enough for that `peak` to be in the worker's hands rather than
         // still in the channel — otherwise `Shutdown` could win the race and
-        // the drop would be testing nothing.
-        std::thread::sleep(Duration::from_millis(250));
+        // the drop would be testing nothing. `peak` itself now times out after
+        // TEST_TIMEOUT, so this waits less than that.
+        std::thread::sleep(TEST_TIMEOUT / 4);
 
         let (done_tx, done_rx) = mpsc::channel();
         std::thread::spawn(move || {
@@ -1289,9 +1334,9 @@ mod tests {
         });
 
         let elapsed = done_rx
-            .recv_timeout(COMMAND_TIMEOUT * 3)
+            .recv_timeout(COMMAND_TIMEOUT)
             .expect("MicHandle::drop hung on a wedged worker — the join is unbounded again");
-        assert!(elapsed >= COMMAND_TIMEOUT, "drop gave up before the bound: {elapsed:?}");
+        assert!(elapsed >= TEST_TIMEOUT, "drop gave up before the bound: {elapsed:?}");
 
         // Let the detached worker finish so it does not outlive the test run.
         let _ = release_tx.send(());
@@ -1700,8 +1745,7 @@ mod tests {
     }
 
     /// `Endpoint::refresh()` against real hardware, driven the way a hotplug
-    /// callback drives it — and the first time it has had a caller at all
-    /// since it was written in Task 5.
+    /// callback drives it.
     ///
     /// This does not need a device to actually appear or disappear: the
     /// command is what the callback sends, so injecting it exercises the whole

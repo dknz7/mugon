@@ -89,19 +89,34 @@ let devices: DeviceInfo[] = [];
  *  recording commits or cancels; `AppState.hotkey_display` takes back over. */
 let recordingCombo: string | null = null;
 
+/** Device names and ids are attacker-adjacent data in the mundane sense:
+ *  Windows lets anyone rename a capture device to anything at all in Sound
+ *  settings. Interpolated into `innerHTML`, a name containing `&` renders
+ *  wrong and one containing `<` silently swallows the rest of the dropdown.
+ *  Built as elements with `textContent` instead, so the string is never
+ *  parsed as markup. */
+function option(value: string, label: string): HTMLOptionElement {
+  const el = document.createElement("option");
+  el.value = value;
+  el.textContent = label;
+  return el;
+}
+
 function renderDeviceOptions(selected: string | null) {
-  const known = devices.map(
-    (d) => `<option value="${d.id}">${d.name}${d.is_default ? " (default)" : ""}</option>`,
-  );
+  const options = [option("", "System default")];
+
   // §5: a saved device absent from the enumerated list (e.g. unplugged)
   // must stay visible rather than the dropdown silently snapping to
   // "System default" and losing the user's setting.
   const known_ids = new Set(devices.map((d) => d.id));
-  const missing =
-    selected !== null && !known_ids.has(selected)
-      ? `<option value="${selected}">${selected} (not connected)</option>`
-      : "";
-  els.device.innerHTML = `<option value="">System default</option>${missing}${known.join("")}`;
+  if (selected !== null && !known_ids.has(selected)) {
+    options.push(option(selected, `${selected} (not connected)`));
+  }
+  for (const d of devices) {
+    options.push(option(d.id, `${d.name}${d.is_default ? " (default)" : ""}`));
+  }
+
+  els.device.replaceChildren(...options);
   els.device.value = selected ?? "";
 }
 
@@ -133,10 +148,23 @@ function render(s: AppState) {
     bare: s.hotkey_is_bare_printable && !s.recording,
   });
 
-  // "The last thing that went wrong", not "something is wrong right now" —
-  // no user-dismiss path, stays pinned until a later fallible call succeeds.
-  els.error.hidden = s.last_error === null;
-  if (s.last_error !== null) els.error.textContent = truncate(s.last_error, ERROR_MAX_CHARS);
+  // `hook_error` wins over `last_error`: a device error is "the last thing
+  // that went wrong" and clears on the next successful call, whereas a hook
+  // that would not install means the hotkey does nothing for the rest of the
+  // session (§7). Showing the transient one on top of the permanent one would
+  // bury the more important message seconds after it appeared.
+  //
+  // The full text goes in `title` because the banner is a single fixed-width
+  // line — see ERROR_MAX_CHARS — and the hook message carries the underlying
+  // Win32 error at the end, which is worth keeping recoverable on hover.
+  const banner = s.hook_error ?? s.last_error;
+  els.error.hidden = banner === null;
+  // The label is a CSS ::before, so the variant is a class rather than text.
+  els.error.classList.toggle("banner--hook", s.hook_error !== null);
+  if (banner !== null) {
+    els.error.textContent = truncate(banner, ERROR_MAX_CHARS);
+    els.error.title = banner;
+  }
 
   els.toast.checked = s.notifications.toast;
   els.sound.checked = s.notifications.sound;
