@@ -1,0 +1,79 @@
+[package]
+name = "mugon"
+version = "0.1.0"
+description = "Tray microphone mute and push-to-talk for Windows"
+authors = ["Byron Dickens"]
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[lib]
+# The `_lib` suffix may seem redundant but it is necessary
+# to make the lib name unique and wouldn't conflict with the bin name.
+# This seems to be only an issue on Windows, see https://github.com/rust-lang/cargo/issues/8519
+name = "mugon_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+# `tray-icon` for the system tray (§4.9); `image-png` so `Image::from_bytes`
+# can decode the tray glyphs, which are PNG rather than ICO.
+tauri = { version = "2", features = ["tray-icon", "image-png"] }
+tauri-plugin-notification = "2"
+tauri-plugin-autostart = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "1"
+
+# Task 9b: `#[implement(IMMNotificationClient)]` expands to `::windows_core::…`
+# paths, so the crate `windows` re-exports as `windows::core` must also be a
+# direct dependency by its own name. Same version `windows` itself resolves to,
+# so the two are one crate instance and the generated code lines up with the
+# interface definitions it implements.
+windows-core = "0.61"
+
+[dependencies.windows]
+version = "0.61"
+features = [
+  "Win32_Foundation",
+  "Win32_UI_Input_KeyboardAndMouse",
+  "Win32_UI_WindowsAndMessaging",
+  "Win32_Media",
+  "Win32_Media_Audio",
+  "Win32_Media_Audio_Endpoints",
+  "Win32_System_Com",
+  "Win32_System_Com_StructuredStorage",
+  "Win32_System_Variant",
+  "Win32_Devices_FunctionDiscovery",
+  "Win32_UI_Shell_PropertiesSystem",
+]
+
+[dev-dependencies]
+tempfile = "3"
+
+# DESIGN.md §10.
+#
+# `panic = "abort"` is the one setting here with a behavioural consequence, so
+# it is spelled out rather than left to a reader to infer: on a panic the
+# process dies **without unwinding**, so no `Drop` impl runs. Three components
+# document drop-based cleanup — `hotplug::Registration` (unregisters the
+# `IMMNotificationClient`), `CaptureStream` (releases the WASAPI stream and
+# clears the mic-in-use indicator) and `MicHandle` (joins the audio worker).
+# None of them run on a panic under this profile. That is accepted: every one
+# of those resources is reclaimed by Windows when the process exits, and the
+# drop order they rely on still holds on every ordinary exit path (tray Quit,
+# `WM_ENDSESSION`, window close), which is where it was designed to matter.
+#
+# The cleanup that is **not** merely nice to have is the microphone, and it does
+# not depend on `Drop`: `main.rs` installs a panic hook, panic hooks run before
+# the abort, and `emergency_unmute` restores the mic from there. Verified
+# empirically under this exact profile — see `examples/panic_hook_abort.rs`.
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
+

@@ -1,0 +1,162 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <link rel="stylesheet" href="/src/styles.css" />
+    <title>mugon</title>
+    <script type="module" src="/src/main.ts" defer></script>
+  </head>
+
+  <body>
+    <main class="app">
+      <!-- Hero microphone. Markup is rendered by src/components/hero.ts. -->
+      <div id="hero" class="hero-slot"></div>
+
+      <section class="card">
+        <!--
+          AppState.last_error. Not an alarm: it is "the last thing that went
+          wrong", it has no user-dismiss path, and it can stay pinned across
+          several commands (see the doc comment in src-tauri/src/state.rs).
+          The "Last problem" label is a CSS ::before, so Task 14 can overwrite
+          the element's text content without losing it.
+        -->
+        <p id="error-banner" class="banner" hidden>
+          Could not open the saved device; running on the system default.
+        </p>
+
+        <div class="section">
+          <span class="field-label" id="device-label">Input device</span>
+          <div class="select-wrap">
+            <select id="device" aria-labelledby="device-label">
+              <option>System default</option>
+            </select>
+          </div>
+
+          <div class="meter-row">
+            <div class="meter"><div id="meter" class="meter-fill"></div></div>
+            <span id="meter-value" class="meter-value">-60.0 dB</span>
+          </div>
+        </div>
+
+        <div class="section">
+          <label class="field-label" for="volume">Microphone volume</label>
+          <div class="slider-wrap">
+            <input id="volume" type="range" min="0" max="100" value="100" />
+          </div>
+        </div>
+
+        <!--
+          AppState.manual_controls_enabled lands on this row: Task 14 sets
+          `disabled` on the switch, and .control-row dims its own label to
+          match. Push to talk owns the mute state, so the switch goes inert.
+        -->
+        <div class="section control-row">
+          <label class="row-label" for="mute-switch">Microphone muted</label>
+          <input id="mute-switch" class="switch switch-danger" type="checkbox" />
+        </div>
+
+        <div class="section">
+          <label class="field-label" for="mode">Action</label>
+          <div class="select-wrap">
+            <select id="mode">
+              <option value="MuteToggle">Mute toggle</option>
+              <option value="PushToTalk">Push to talk</option>
+            </select>
+          </div>
+        </div>
+
+        <div class="section">
+          <span class="field-label">Hotkey</span>
+          <!-- Modifier chips are real checkboxes so the label toggles them and
+               the keyboard reaches them; the chip look is CSS on the label. -->
+          <div class="modifier-row">
+            <input id="mod-ctrl" class="chip-input" type="checkbox" />
+            <label class="chip" for="mod-ctrl">Ctrl</label>
+            <input id="mod-alt" class="chip-input" type="checkbox" />
+            <label class="chip" for="mod-alt">Alt</label>
+            <input id="mod-shift" class="chip-input" type="checkbox" />
+            <label class="chip" for="mod-shift">Shift</label>
+            <input id="mod-win" class="chip-input" type="checkbox" />
+            <label class="chip" for="mod-win">Win</label>
+          </div>
+          <!-- `.select-wrap` is what draws the chevron (styles.css) — a bare
+               <select> has `appearance: none` and no affordance at all. -->
+          <div class="select-wrap">
+            <!-- Options are filled from `list_bindable_keys` — the same list the
+                 backend accepts. Nothing here is hardcoded. -->
+            <select id="hotkey-key" aria-label="Hotkey key"></select>
+          </div>
+          <div class="hotkey-status-row">
+            <!-- The "HOTKEY STATUS:" label is static markup; only the value
+                 comes from Rust, and it is rendered verbatim. Composing the two
+                 in TypeScript would be the frontend building a display string,
+                 which task-14-amendment §2 forbids. -->
+            <p class="hotkey-status">
+              <span class="hotkey-status-label">HOTKEY STATUS:</span>
+              <span id="hotkey-status">Not set</span>
+            </p>
+            <button id="hotkey-clear" class="btn btn-quiet" type="button">Clear</button>
+          </div>
+          <p id="hotkey-hint" class="hotkey-hint" hidden>
+            The hotkey does not fire while this window is focused — click another
+            window, or close mugon to the tray.
+          </p>
+          <p id="hotkey-warning" class="warning" hidden>
+            A bare printable key is bound — in Push-to-Talk, holding it repeats that
+            character into whatever is focused (e.g. hold V to talk and you type
+            "vvvvvvv").
+          </p>
+        </div>
+      </section>
+
+      <div class="footer">
+        <button
+          id="settings-cog"
+          class="cog"
+          type="button"
+          title="Settings"
+          aria-controls="settings-panel"
+          aria-expanded="false"
+        >
+          <svg viewBox="0 0 24 24" width="14" height="14" fill="none"
+               stroke="currentColor" stroke-width="1.7" stroke-linecap="round"
+               stroke-linejoin="round" aria-hidden="true">
+            <circle cx="12" cy="12" r="3.2" />
+            <path d="M19.3 14.6a1.6 1.6 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.6 1.6 0 0 0-1.8-.3 1.6 1.6 0 0 0-1 1.5v.2a2 2 0 1 1-4 0v-.1a1.6 1.6 0 0 0-1-1.5 1.6 1.6 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.6 1.6 0 0 0 .3-1.8 1.6 1.6 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.6 1.6 0 0 0 1.5-1 1.6 1.6 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.6 1.6 0 0 0 1.8.3h.1a1.6 1.6 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.6 1.6 0 0 0 1 1.5 1.6 1.6 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.6 1.6 0 0 0-.3 1.8v.1a1.6 1.6 0 0 0 1.5 1h.2a2 2 0 1 1 0 4h-.1a1.6 1.6 0 0 0-1.5 1z" />
+          </svg>
+          <span class="cog-label">Settings</span>
+        </button>
+      </div>
+    </main>
+
+    <!--
+      Collapsed by default — that is what buys the room at 460x700. It opens as
+      a sheet over the controls rather than in flow, so neither state can push
+      the page into a scrollbar. The hero stays visible above it.
+    -->
+    <section id="settings-panel" class="sheet" hidden aria-label="Settings">
+      <h2 class="sheet-title">Settings</h2>
+
+      <div class="control-row">
+        <label class="row-label" for="toast-switch">Desktop notifications</label>
+        <input id="toast-switch" class="switch" type="checkbox" />
+      </div>
+
+      <div class="control-row">
+        <label class="row-label" for="sound-switch">Notification sound</label>
+        <input id="sound-switch" class="switch" type="checkbox" />
+      </div>
+
+      <div class="control-row">
+        <label class="row-label" for="autostart-switch">Run at login</label>
+        <input id="autostart-switch" class="switch" type="checkbox" />
+      </div>
+
+      <p class="sheet-note">
+        Closing this window leaves mugon running in the tray. The hotkey keeps
+        working.
+      </p>
+    </section>
+  </body>
+</html>

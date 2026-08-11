@@ -1,0 +1,809 @@
+/* mugon — DESIGN.md §5. Asphalt greys, off-white text, one teal accent.
+   The window is a fixed 460x880 with no scrollbar, so every size below is
+   part of a budget, not a suggestion. */
+
+:root {
+  --bg: #14161a;
+  --surface: #1c1f25;
+  --elevated: #23272e;
+  --border: #2e333c;
+  --text: #e8eaed;
+  --text-dim: #9aa1ac;
+  --accent: #4db6ac;
+  --accent-dim: #2f6f69;
+  --danger: #e5675b;
+  --warn: #d8a657;
+
+  /* rgb() parts of --accent / --danger, for translucent fills. */
+  --accent-rgb: 77, 182, 172;
+  --danger-rgb: 229, 103, 91;
+
+  --radius: 14px;
+  --pad-x: 18px;
+
+  --hero-block: 152px;
+
+  color-scheme: dark;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+[hidden] {
+  display: none !important;
+}
+
+html,
+body {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  padding: 14px var(--pad-x) 10px;
+  background: var(--bg);
+  color: var(--text);
+  font:
+    13.5px/1.45 "Segoe UI Variable Text",
+    "Segoe UI",
+    system-ui,
+    sans-serif;
+  -webkit-font-smoothing: antialiased;
+  user-select: none;
+  /* Horizontal never — the layout is a fixed 460 and a sideways scrollbar is
+     always a bug. Vertical only when the content genuinely does not fit, which
+     happens when `tray::window_height` clamps the window to a short or scaled
+     display. Without this that clamp would simply hide `#settings-cog`, the
+     only way out of the settings sheet, with no symptom — the clamp and this
+     rule are a pair. */
+  overflow-x: hidden;
+  overflow-y: auto;
+}
+
+/* A very faint teal wash behind the hero. Depth without a second colour. */
+body::before {
+  content: "";
+  position: fixed;
+  inset: -120px -80px auto -80px;
+  height: 320px;
+  background: radial-gradient(
+    ellipse at 50% 60%,
+    rgba(var(--accent-rgb), 0.09) 0%,
+    rgba(var(--accent-rgb), 0) 65%
+  );
+  pointer-events: none;
+}
+
+.app {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  min-height: 100%;
+}
+
+:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+/* ---------------------------------------------------------------- hero -- */
+
+/* Sits above the settings sheet's scrim: opening settings must not dim the one
+   thing in the window that has to stay readable. */
+.hero-slot {
+  position: relative;
+  z-index: 3;
+  display: grid;
+  place-items: center;
+  height: var(--hero-block);
+  flex: none;
+}
+
+.hero {
+  display: grid;
+  justify-items: center;
+  gap: 12px;
+  color: var(--accent);
+}
+
+.hero-stage {
+  position: relative;
+  display: grid;
+  place-items: center;
+  width: 118px;
+  height: 118px;
+}
+
+.hero-glow,
+.hero-rim,
+.hero-ring {
+  position: absolute;
+  border-radius: 50%;
+}
+
+.hero-glow {
+  width: 118px;
+  height: 118px;
+  background: radial-gradient(
+    circle at 50% 50%,
+    rgba(var(--accent-rgb), 0.22) 0%,
+    rgba(var(--accent-rgb), 0.07) 46%,
+    rgba(var(--accent-rgb), 0) 71%
+  );
+  animation: hero-glow 3.6s ease-in-out infinite;
+  transition: opacity 220ms ease;
+}
+
+/* The structural ring: always drawn, so the collapse of the animated ring
+   reads as "the ring switched off" rather than "something vanished". */
+.hero-rim {
+  width: 92px;
+  height: 92px;
+  border: 1px solid rgba(var(--accent-rgb), 0.24);
+  transition:
+    border-color 220ms ease,
+    transform 260ms ease;
+}
+
+.hero-ring {
+  width: 92px;
+  height: 92px;
+  border: 1.5px solid var(--accent);
+  opacity: 0.42;
+  animation: hero-breathe 3.6s ease-in-out infinite;
+  transition:
+    opacity 200ms ease,
+    transform 260ms ease;
+}
+
+@keyframes hero-breathe {
+  0%,
+  100% {
+    transform: scale(0.93);
+    opacity: 0.45;
+  }
+  50% {
+    transform: scale(1.17);
+    opacity: 0.12;
+  }
+}
+
+@keyframes hero-glow {
+  0%,
+  100% {
+    opacity: 0.55;
+  }
+  50% {
+    opacity: 1;
+  }
+}
+
+.hero-mic {
+  position: relative;
+  transition: color 220ms ease;
+}
+
+.hero-strike {
+  stroke: var(--danger);
+  stroke-width: 1.7;
+  transition: stroke-dashoffset 320ms ease 40ms;
+}
+
+/* Knockout under the red strike so it reads as a cut through the mic rather
+   than a line drawn on top of it. */
+.hero-strike-cut {
+  stroke: var(--bg);
+  stroke-width: 3.6;
+}
+
+.hero-caption {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  margin: 0;
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: 0.17em;
+  text-transform: uppercase;
+  color: var(--accent);
+  transition: color 220ms ease;
+}
+
+.hero-caption::before {
+  content: "";
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: currentColor;
+  box-shadow: 0 0 9px currentColor;
+}
+
+/* Muted. Four independent signals — colour, ring, strike, caption — so no one
+   of them has to survive alone. */
+.hero.is-muted {
+  color: #6d757f;
+}
+.hero.is-muted .hero-glow {
+  opacity: 0;
+  animation: none;
+}
+.hero.is-muted .hero-rim {
+  border-color: var(--border);
+  transform: scale(0.82);
+}
+.hero.is-muted .hero-ring {
+  opacity: 0;
+  transform: scale(0.78);
+  animation: none;
+}
+.hero.is-muted .hero-strike {
+  stroke-dashoffset: 0;
+}
+.hero.is-muted .hero-caption {
+  color: var(--danger);
+}
+
+/* --------------------------------------------------------------- card --- */
+
+.card {
+  position: relative;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 2px 16px;
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.03),
+    0 8px 22px rgba(0, 0, 0, 0.28);
+}
+
+.section {
+  padding: 11px 0;
+}
+
+.section + .section {
+  border-top: 1px solid var(--border);
+}
+
+/* Section headings shout quietly; control rows are read as sentences. */
+.field-label {
+  display: block;
+  margin-bottom: 7px;
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: 0.09em;
+  text-transform: uppercase;
+  color: var(--text-dim);
+}
+
+.row-label {
+  color: var(--text);
+  cursor: pointer;
+}
+
+.control-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+/* AppState.manual_controls_enabled: Task 14 disables the input, the row
+   follows. */
+.control-row:has(input:disabled) .row-label {
+  opacity: 0.4;
+}
+
+/* ------------------------------------------------------- error banner --- */
+
+.banner {
+  margin: 10px 0 0;
+  padding: 9px 11px 9px 12px;
+  border: 1px solid var(--border);
+  border-left: 2px solid rgba(216, 166, 87, 0.65);
+  border-radius: 8px;
+  background: rgba(216, 166, 87, 0.05);
+  color: var(--text-dim);
+  font-size: 12px;
+  line-height: 1.4;
+  /* Real COM error strings run long; the 460x880 window has no scroll
+     fallback and #settings-cog is the only way out of the settings sheet, so
+     an unbounded banner clipping it off-screen would strand the user with no
+     visible symptom (task-14-amendment.md §4). A hard 2-line clip (box-sizing
+     is border-box, so this height includes the 9px top/bottom padding) is
+     simpler and more reliably clipped across engines than -webkit-line-clamp. */
+  max-height: 54px; /* one line + the "LAST PROBLEM" label, Task 13's original budget */
+  overflow: hidden;
+}
+
+/* Past tense, by construction. A ::before rather than a child element so
+   Task 14 can overwrite the banner's text content without losing the label. */
+.banner::before {
+  content: "Last problem";
+  display: block;
+  margin-bottom: 3px;
+  font-size: 9.5px;
+  font-weight: 600;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--warn);
+  opacity: 0.85;
+}
+
+/* A hook that would not install is not a past problem — it is the current,
+   permanent state of the session, and "Last problem" reads as though it has
+   already passed. Same banner, honest label. */
+.banner--hook::before {
+  content: "Hotkey disabled";
+}
+
+/* ------------------------------------------------------------ controls -- */
+
+.select-wrap {
+  position: relative;
+}
+
+.select-wrap::after {
+  content: "";
+  position: absolute;
+  right: 13px;
+  top: 50%;
+  width: 6px;
+  height: 6px;
+  margin-top: -5px;
+  border-right: 1.5px solid var(--text-dim);
+  border-bottom: 1.5px solid var(--text-dim);
+  transform: rotate(45deg);
+  pointer-events: none;
+}
+
+select {
+  width: 100%;
+  appearance: none;
+  padding: 9px 32px 9px 11px;
+  background: var(--elevated);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  font: inherit;
+  cursor: pointer;
+  text-overflow: ellipsis;
+  transition:
+    border-color 140ms ease,
+    background-color 140ms ease;
+}
+
+select:hover:not(:disabled) {
+  border-color: var(--accent-dim);
+}
+
+select:disabled,
+button:disabled,
+input:disabled {
+  opacity: 0.42;
+  cursor: not-allowed;
+}
+
+.btn {
+  padding: 8px 13px;
+  background: var(--elevated);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  font: inherit;
+  font-size: 12.5px;
+  cursor: pointer;
+  white-space: nowrap;
+  transition:
+    border-color 140ms ease,
+    color 140ms ease,
+    background-color 140ms ease;
+}
+
+.btn:hover:not(:disabled) {
+  border-color: var(--accent-dim);
+  color: var(--accent);
+}
+
+.btn:active:not(:disabled) {
+  background: #1a1d22;
+}
+
+.btn-quiet {
+  background: none;
+  color: var(--text-dim);
+}
+
+.btn-quiet:hover:not(:disabled) {
+  color: var(--text);
+  border-color: var(--border);
+}
+
+/* Switches. Kept as real checkboxes so Task 14 reads `.checked`. */
+.switch {
+  position: relative;
+  flex: none;
+  width: 38px;
+  height: 21px;
+  margin: 0;
+  appearance: none;
+  border-radius: 999px;
+  background: var(--elevated);
+  border: 1px solid var(--border);
+  cursor: pointer;
+  transition:
+    background-color 180ms ease,
+    border-color 180ms ease;
+}
+
+.switch::after {
+  content: "";
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 15px;
+  height: 15px;
+  border-radius: 50%;
+  background: var(--text-dim);
+  transition:
+    transform 180ms cubic-bezier(0.34, 1.3, 0.64, 1),
+    background-color 180ms ease;
+}
+
+.switch:checked {
+  background: rgba(var(--accent-rgb), 0.22);
+  border-color: var(--accent-dim);
+}
+
+.switch:checked::after {
+  transform: translateX(17px);
+  background: var(--accent);
+}
+
+/* Muted is a red state everywhere, including here. */
+.switch-danger:checked {
+  background: rgba(var(--danger-rgb), 0.22);
+  border-color: rgba(var(--danger-rgb), 0.55);
+}
+
+.switch-danger:checked::after {
+  background: var(--danger);
+}
+
+/* Volume. Left native on purpose: `accent-color` is the only way to get the
+   filled portion of the track to follow the thumb without JS, and Task 14 does
+   not know it would have to keep a custom fill in step. */
+.slider-wrap {
+  display: flex;
+  align-items: center;
+  height: 22px;
+}
+
+#volume {
+  width: 100%;
+  height: 18px;
+  margin: 0;
+  accent-color: var(--accent);
+  cursor: pointer;
+}
+
+/* ---------------------------------------------------------- level meter -- */
+
+.meter-row {
+  display: flex;
+  align-items: center;
+  gap: 11px;
+  margin-top: 11px;
+}
+
+.meter {
+  position: relative;
+  flex: 1;
+  height: 6px;
+  border-radius: 999px;
+  background: var(--elevated);
+  box-shadow: inset 0 0 0 1px var(--border);
+  overflow: hidden;
+}
+
+/* Band marks at -12 dB and -3 dB on a -60..0 scale (DESIGN.md §4.7). */
+.meter::before,
+.meter::after {
+  content: "";
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 1px;
+  background: var(--bg);
+  opacity: 0.75;
+}
+.meter::before {
+  left: 80%;
+}
+.meter::after {
+  left: 95%;
+}
+
+.meter-fill {
+  height: 100%;
+  width: 0%;
+  border-radius: 999px;
+  background: var(--accent);
+  transition:
+    width 60ms linear,
+    background-color 120ms linear;
+}
+
+.meter-fill.is-warn {
+  background: var(--warn);
+}
+.meter-fill.is-hot {
+  background: var(--danger);
+}
+
+.meter-value {
+  min-width: 62px;
+  text-align: right;
+  font-size: 11.5px;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-dim);
+}
+
+/* --------------------------------------------------------------- hotkey -- */
+
+/* Modifier chips. The checkbox itself is hidden but still focusable, so the
+   label carries the focus ring on its behalf via :focus-visible + . */
+.modifier-row {
+  display: flex;
+  gap: 6px;
+  margin-bottom: 8px;
+}
+
+.chip-input {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  opacity: 0;
+  pointer-events: none;
+}
+
+.chip {
+  flex: 1;
+  padding: 7px 0;
+  background: var(--elevated);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  color: var(--text-dim);
+  font-size: 11.5px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-align: center;
+  cursor: pointer;
+  user-select: none;
+  transition:
+    border-color 140ms ease,
+    color 140ms ease,
+    background 140ms ease;
+}
+
+.chip:hover {
+  color: var(--text);
+}
+
+.chip-input:checked + .chip {
+  border-color: var(--accent);
+  background: rgba(var(--accent-rgb), 0.12);
+  color: var(--accent);
+}
+
+.chip-input:focus-visible + .chip {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.hotkey-status-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-top: 9px;
+}
+
+/* The confirm prompt. Deliberately quiet: it is a standing instruction, not an
+   error, and it sits directly under the control it refers to. */
+.hotkey-status {
+  margin: 0;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-dim);
+  font-size: 11.5px;
+  letter-spacing: 0.02em;
+}
+
+/* The focus limitation (§4.4). Quieter than the bare-key warning: that one is
+   about a binding the user may not want, this one is about how to use the one
+   they have.
+
+   Clipped like `.banner`, and for the same reason: two lines is only two lines
+   while the font metrics hold. A missing "Segoe UI Variable Text" falling back
+   to a wider face, or a user text-size setting, adds ~15px each — enough to eat
+   the whole vertical budget. Bounded beats estimated. */
+.hotkey-hint {
+  margin: 7px 0 0;
+  color: var(--text-dim);
+  font-size: 11px;
+  line-height: 1.4;
+  opacity: 0.8;
+  max-height: 31px; /* 2 lines at 11px/1.4 */
+  overflow: hidden;
+}
+
+.hotkey-status-row .btn {
+  flex: none;
+  padding: 5px 10px;
+  font-size: 11.5px;
+}
+
+.hotkey-status-label {
+  color: var(--text-dim);
+}
+
+/* The state classes land on the value span, not the row, so the static label
+   keeps its neutral colour and only the part that changes is emphasised. */
+#hotkey-status.is-unconfirmed {
+  color: var(--accent);
+}
+
+#hotkey-status.is-inactive {
+  color: var(--warn);
+}
+
+/* Same bounded-not-estimated rule as `.hotkey-hint` and `.banner`. */
+.warning {
+  margin: 9px 0 0;
+  color: var(--warn);
+  font-size: 11.5px;
+  line-height: 1.4;
+  max-height: 49px; /* 3 lines at 11.5px/1.4 */
+  overflow: hidden;
+}
+
+/* --------------------------------------------------------------- footer -- */
+
+.footer {
+  display: flex;
+  justify-content: center;
+  margin-top: auto;
+  padding-top: 12px;
+}
+
+.cog {
+  position: relative;
+  z-index: 3;
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  padding: 7px 12px;
+  background: none;
+  border: 1px solid transparent;
+  border-radius: 999px;
+  color: var(--text-dim);
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+  transition:
+    color 140ms ease,
+    border-color 140ms ease;
+}
+
+.cog:hover {
+  color: var(--text);
+  border-color: var(--border);
+}
+
+.cog svg {
+  transition: transform 320ms ease;
+}
+
+.cog[aria-expanded="true"] {
+  color: var(--accent);
+}
+
+.cog[aria-expanded="true"] svg {
+  transform: rotate(60deg);
+}
+
+/* -------------------------------------------------------- settings sheet -- */
+
+/* Overlays the controls instead of sitting in flow: at a fixed 880px there is
+   no room for both, and a scrollbar is not an option. It is only as tall as
+   its contents; the 100vh-spread shadow is the scrim over everything else, and
+   the cog stays lit on top of it as the way back out. */
+.sheet {
+  position: fixed;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  z-index: 2;
+  padding: 15px var(--pad-x) 54px;
+  background: var(--surface);
+  border-top: 1px solid var(--border);
+  border-radius: var(--radius) var(--radius) 0 0;
+  box-shadow:
+    0 -16px 34px rgba(0, 0, 0, 0.45),
+    0 0 0 100vh rgba(10, 11, 13, 0.62);
+  animation: sheet-in 220ms cubic-bezier(0.2, 0.8, 0.3, 1);
+}
+
+@keyframes sheet-in {
+  from {
+    transform: translateY(18px);
+    opacity: 0;
+  }
+}
+
+.sheet-title {
+  margin: 0 0 4px;
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: 0.09em;
+  text-transform: uppercase;
+  color: var(--text-dim);
+}
+
+.sheet .control-row {
+  padding: 13px 0;
+  border-bottom: 1px solid var(--border);
+}
+
+.sheet .control-row:last-of-type {
+  border-bottom: 0;
+}
+
+.sheet-note {
+  margin: 10px 0 0;
+  color: var(--text-dim);
+  font-size: 11.5px;
+  line-height: 1.45;
+  opacity: 0.75;
+}
+
+/* --------------------------------------------------------- reduced motion -- */
+
+/* Freeze the decoration, keep the information. Live still reads as a teal mic
+   inside a teal ring with a teal caption; muted still reads as a grey mic with
+   a red strike and a red caption. Nothing here depends on movement. */
+@media (prefers-reduced-motion: reduce) {
+  .hero-glow {
+    animation: none;
+    opacity: 1;
+  }
+
+  .hero-ring {
+    animation: none;
+    opacity: 0.45;
+    transform: scale(1);
+  }
+
+  .hero-mic,
+  .hero-strike,
+  .hero-rim,
+  .hero-ring,
+  .hero-caption,
+  .switch,
+  .switch::after,
+  .cog svg,
+  .meter-fill {
+    transition: none;
+  }
+
+  .hero.is-muted .hero-ring {
+    transform: scale(0.78);
+  }
+
+  .sheet {
+    animation: none;
+  }
+}
