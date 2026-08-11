@@ -9,6 +9,41 @@ export interface DeviceInfo {
 
 export type Mode = "MuteToggle" | "PushToTalk";
 
+/** One `<optgroup>` in the key dropdown, straight from `hotkey::keys`. */
+export interface KeyGroup {
+  label: string;
+  keys: string[];
+}
+
+/**
+ * A binding as the picker's controls hold it. `key` is a **name** from
+ * `list_bindable_keys` — never a raw VK — so the value the dropdown shows is
+ * the value `set_hotkey` takes back.
+ */
+export interface HotkeyParts {
+  ctrl: boolean;
+  alt: boolean;
+  shift: boolean;
+  win: boolean;
+  key: string;
+}
+
+/**
+ * The `HOTKEY STATUS` line. `label` is rendered verbatim; `kind` is what the
+ * styling switches on.
+ *
+ * They travel together so the frontend never has to infer one from the other.
+ * Deriving the accent colour by prefix-matching `label` would make it an
+ * undeclared enum — a copy edit on the Rust side would silently stop the
+ * colouring, with every test on both sides still passing.
+ */
+export type HotkeyStatusKind = "Inactive" | "NotSet" | "Bound" | "Confirmed";
+
+export interface HotkeyStatus {
+  kind: HotkeyStatusKind;
+  label: string;
+}
+
 /**
  * Mirrors `state::AppState`. There is **no** `devices` field: device
  * enumeration is its own command (`list_devices`), kept off the hot
@@ -24,12 +59,17 @@ export interface AppState {
   mode: Mode;
   muted: boolean;
   volume: number;
-  hotkey_display: string | null;
   hotkey_is_bare_printable: boolean;
+  /** The binding split into what the four chips and the dropdown bind to. */
+  hotkey: HotkeyParts | null;
+  /**
+   * The `HOTKEY STATUS` line. Render `label` as given — do not parse it and do
+   * not rebuild it here (task-14-amendment §2); switch on `kind` instead.
+   */
+  hotkey_status: HotkeyStatus;
   manual_controls_enabled: boolean;
   notifications: { toast: boolean; sound: boolean };
   autostart: boolean;
-  recording: boolean;
   last_error: string | null;
   /**
    * Why the keyboard hook is not running, or `null` while it is.
@@ -49,9 +89,10 @@ export const api = {
   setMode: (mode: Mode) => invoke<void>("set_mode", { mode }),
   setVolume: (level: number) => invoke<void>("set_volume", { level }),
   toggleMute: () => invoke<void>("toggle_mute"),
-  beginRecording: () => invoke<void>("begin_hotkey_recording"),
-  cancelRecording: () => invoke<void>("cancel_hotkey_recording"),
-  clearHotkey: () => invoke<void>("clear_hotkey"),
+  listBindableKeys: () => invoke<KeyGroup[]>("list_bindable_keys"),
+  /** `key: null` clears the binding. */
+  setHotkey: (ctrl: boolean, alt: boolean, shift: boolean, win: boolean, key: string | null) =>
+    invoke<void>("set_hotkey", { ctrl, alt, shift, win, key }),
   setNotificationPrefs: (toast: boolean, sound: boolean) =>
     invoke<void>("set_notification_prefs", { toast, sound }),
   setAutostart: (enabled: boolean) => invoke<void>("set_autostart", { enabled }),
@@ -75,7 +116,3 @@ export const onLevel = (cb: (peakDb: number) => void) =>
 export const onDevicesChanged = (cb: () => void) =>
   listen<null>("devices-changed", () => cb());
 
-export const onRecording = (cb: (active: boolean, combo: string | null) => void) =>
-  listen<{ active: boolean; combo: string | null }>("hotkey-recording", (e) =>
-    cb(e.payload.active, e.payload.combo),
-  );

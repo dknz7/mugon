@@ -8,6 +8,7 @@
 use tauri::{AppHandle, State};
 
 use crate::audio::{DeviceInfo, MicBackend};
+use crate::hotkey::keys::KeyGroup;
 use crate::modes::Mode;
 use crate::state::{emit_state, lock_or_recover, AppState, Shared};
 
@@ -88,32 +89,44 @@ pub fn toggle_mute(app: AppHandle, core: State<Shared>) {
     emit_state(&app);
 }
 
+/// Every key the picker may offer, grouped for its dropdown.
+///
+/// Static for the life of the process, so the frontend calls it once on window
+/// open alongside `list_devices` rather than on every render. It is a command
+/// rather than a constant in TypeScript because the offered list and the list
+/// [`set_hotkey`] accepts have to be the same object — see
+/// [`crate::hotkey::keys::bindable_groups`].
 #[tauri::command]
-pub fn begin_hotkey_recording(app: AppHandle, core: State<Shared>) {
-    {
-        let mut c = lock_or_recover(&core);
-        c.recorder.start();
-    }
-    emit_state(&app);
+pub fn list_bindable_keys() -> Vec<KeyGroup> {
+    crate::hotkey::keys::bindable_groups()
 }
 
+/// Binds the combo chosen in the picker, or clears it when `key` is `None`.
+///
+/// Returns the rejection reason rather than silently ignoring a bad request:
+/// the frontend only ever sends names it was offered, so an `Err` here means
+/// the two lists have drifted and that should be visible, not swallowed.
+///
+/// **The `Result` is not the delivery mechanism.** `Core::set_hotkey` also folds
+/// the reason into `last_error`, exactly as [`set_autostart`] below does, so it
+/// rides out on the `state-changed` emitted here and lands in the error banner.
+/// The frontend has no error surface of its own — a rejection that only came
+/// back through this return value would reach nobody.
 #[tauri::command]
-pub fn cancel_hotkey_recording(app: AppHandle, core: State<Shared>) {
-    {
-        let mut c = lock_or_recover(&core);
-        c.recorder.cancel();
-    }
+pub fn set_hotkey(
+    app: AppHandle,
+    core: State<Shared>,
+    ctrl: bool,
+    alt: bool,
+    shift: bool,
+    win: bool,
+    key: Option<String>,
+) -> Result<(), String> {
+    // Guard is a temporary of this statement, so it is dead before `emit_state`
+    // below — which takes the same lock.
+    let result = lock_or_recover(&core).set_hotkey(ctrl, alt, shift, win, key.as_deref());
     emit_state(&app);
-}
-
-#[tauri::command]
-pub fn clear_hotkey(app: AppHandle, core: State<Shared>) {
-    {
-        let mut c = lock_or_recover(&core);
-        c.config.hotkey = None;
-        c.persist();
-    }
-    emit_state(&app);
+    result
 }
 
 #[tauri::command]

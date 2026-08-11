@@ -73,6 +73,9 @@ unsafe extern "system" fn hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -
             let (ctrl, alt, shift, win) = modifier_state();
             let ev = HookEvent { vk, down, ctrl, alt, shift, win };
 
+            // A send failure means the dispatch thread is gone, which only
+            // happens during teardown; there is nothing useful to do about it
+            // inside a hook callback that must return promptly.
             if let Some(tx) = SENDER.get() {
                 let _ = tx.send(ev);
             }

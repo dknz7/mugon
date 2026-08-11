@@ -23,6 +23,20 @@ pub struct Config {
     pub device_id: Option<String>,
     pub mode: Mode,
     pub hotkey: Option<Hotkey>,
+    /// Whether this binding has ever actually been *seen* firing (§4.4, Task 17).
+    ///
+    /// Drives the `HOTKEY STATUS` line: a binding is `Bound` until the hook
+    /// observes it once, then `Confirmed`. It exists because the picker replaced
+    /// recording, and recording was the only thing that used to prove a key
+    /// reaches mugon at all — which matters most for F13-F24, since those are
+    /// not physical keys on a standard board and arrive via a remapper that may
+    /// simply not be running.
+    ///
+    /// `#[serde(default)]` so every config file written before this field
+    /// existed still loads. They arrive `false`, which is the honest answer:
+    /// this build has never seen those bindings fire.
+    #[serde(default)]
+    pub hotkey_confirmed: bool,
     pub notifications: NotificationPrefs,
     pub autostart: bool,
 }
@@ -34,6 +48,7 @@ impl Default for Config {
             device_id: None,
             mode: Mode::default(),
             hotkey: None,
+            hotkey_confirmed: false,
             notifications: NotificationPrefs::default(),
             autostart: false,
         }
@@ -124,6 +139,37 @@ mod tests {
                  "notifications":{"toast":true,"sound":false},"autostart":false}"#,
         ).unwrap();
         assert_eq!(Config::load(dir.path()), Config::default());
+    }
+
+    /// Task 17 added `hotkey_confirmed`. Every config file on disk predates it,
+    /// including the owner's, which holds a working `F16`. Loading one must not
+    /// fall into `Config::load`'s corrupt-file path — that would rename his
+    /// config to `.bak` and silently replace his binding and device choice with
+    /// defaults.
+    #[test]
+    fn a_config_written_before_hotkey_confirmed_existed_still_loads() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("config.json"),
+            br#"{"version":1,"device_id":"some-device","mode":"MuteToggle",
+                 "hotkey":{"ctrl":false,"alt":false,"shift":false,"win":false,"key":"F16"},
+                 "notifications":{"toast":true,"sound":true},"autostart":false}"#,
+        )
+        .unwrap();
+
+        let c = Config::load(dir.path());
+
+        assert_eq!(
+            c.hotkey.map(|h| h.display()).as_deref(),
+            Some("F16"),
+            "the existing binding must survive the upgrade"
+        );
+        assert_eq!(c.device_id.as_deref(), Some("some-device"));
+        assert!(!c.hotkey_confirmed, "a binding this build has never seen starts unconfirmed");
+        assert!(
+            !dir.path().join("config.json.bak").exists(),
+            "an older config is not a corrupt one"
+        );
     }
 
     #[test]

@@ -25,7 +25,7 @@ install — no elevation, nothing written outside your profile.
 - Application: `%LOCALAPPDATA%\mugon\`
 - Settings: `%APPDATA%\mugon\config.json`
 - Start Menu shortcut: created by the installer, and **required for toasts** —
-  see limitation 4 below.
+  see limitation 5 below.
 
 Uninstall from Settings → Apps, or run `%LOCALAPPDATA%\mugon\uninstall.exe`.
 
@@ -56,7 +56,7 @@ comms app already uses and both will respond.
 The consequence to be aware of is the other direction. If you bind a bare
 printable character — say `M` — then pressing it mutes your mic **and types an
 `M`**, and in Push to Talk holding it types `M` for as long as you hold. The
-settings window warns you when you record a binding like that. It is not
+settings window warns you when you pick a binding like that. It is not
 stopping you, because for a key bound to a game action that behaviour is the
 entire point; it is telling you so the first time you use it in a chat box is
 not a surprise.
@@ -87,21 +87,31 @@ To get one:
 
 ## Known limitations
 
-Stated up front, because none of these are fixable and all of them are better
-known than discovered:
+Stated up front, because all of them are better known than discovered:
 
-1. **The hotkey does not fire while an elevated window has focus** — unless
+1. **The hotkey does not fire while mugon's own window has focus.** Click any
+   other window, or close mugon to the tray, and it works normally — which is how
+   it is used almost all of the time. The settings panel says so under
+   `HOTKEY STATUS`.
+
+   Unlike the rest of this list, **this one has no known cause.** Nothing in
+   mugon reads window focus, the keyboard hook is global, and four rounds of
+   instrumented diagnosis did not explain it. It is documented rather than fixed
+   because the conventional remedy — reading key events from the settings
+   window itself while it has focus — is real work for a state a tray app is
+   barely ever in. It is deferred, not dismissed.
+2. **The hotkey does not fire while an elevated window has focus** — unless
    mugon itself is running elevated. Low-level keyboard hooks from a
    normal-privilege process do not receive input destined for a higher-privilege
    window. This is a Windows security boundary (UIPI), not a bug, and it cannot
    be worked around from userspace. Practically: click on a non-elevated window
    first, or run mugon elevated if you accept the tradeoff.
-2. **Some antivirus heuristics may flag the binary.** A low-level keyboard hook
+3. **Some antivirus heuristics may flag the binary.** A low-level keyboard hook
    is the same API a keylogger uses, and mugon installs one because it is the
    only way to get key-*up* events, which push-to-talk requires. Code signing
    would reduce false positives; it is out of scope for v1. The source is here
    if you would rather build it yourself.
-3. **`Ctrl+Alt+Del` and the secure desktop cannot be intercepted** by any
+4. **`Ctrl+Alt+Del` and the secure desktop cannot be intercepted** by any
    process, mugon included. A push-to-talk hold interrupted by one — or by a UAC
    prompt or `Win+L` — should be caught by the stuck-key watchdog, which polls
    the key every 250ms and re-mutes rather than leaving the mic open. That is
@@ -111,7 +121,7 @@ known than discovered:
    active desktop is not ours. It has not been tested against a real lock
    screen. If you find your mic still live after unlocking, that is a bug worth
    reporting.
-4. **A portable single-`.exe` cannot toast.** Windows only delivers toast
+5. **A portable single-`.exe` cannot toast.** Windows only delivers toast
    notifications for an application with an AppUserModelID backed by a matching
    Start Menu shortcut, and only the installer creates that shortcut. Run the
    installer if you want toasts. The beep has no such requirement and works
@@ -139,7 +149,7 @@ cd src-tauri
 cargo test
 ```
 
-Note that toasts do **not** appear in a dev build — see limitation 4. They can
+Note that toasts do **not** appear in a dev build — see limitation 5. They can
 only be tested against an installed one.
 
 ## Licence

@@ -184,6 +184,58 @@ pub fn update_icon(app: &AppHandle, muted: bool) {
     }
 }
 
+pub const WINDOW_WIDTH: f64 = 460.0;
+
+/// The height the layout is designed for, in **logical** pixels.
+///
+/// Task 17 raised this from 700. The hotkey row became a picker — four modifier
+/// chips, a dropdown, a status line and the focus hint — which grew that section
+/// from ~37px to ~157px. The §4 stress test (bare printable key bound, an error
+/// banner showing, a long device name) then clipped `#settings-cog` off the
+/// bottom, and that cog is the only way out of the settings sheet.
+///
+/// 880 rather than 800 because the worst case is additive and the banner is the
+/// last term: content bottoms out around 776px with the bare-key warning and the
+/// focus hint both showing, and `.banner` is a further 54px plus its 10px margin.
+/// Re-run that stress test before reducing this.
+pub const WINDOW_HEIGHT: f64 = 880.0;
+
+/// Below this the window is more useless than a scrollbar is ugly.
+const WINDOW_MIN_HEIGHT: f64 = 480.0;
+
+/// Room for the title bar and the taskbar, in logical pixels. `work_area` on
+/// Tauri 2 is not reliably taskbar-excluded across platforms, so this is
+/// subtracted regardless — over-reserving costs a little empty space, and
+/// under-reserving costs the settings cog.
+const CHROME_ALLOWANCE: f64 = 96.0;
+
+/// [`WINDOW_HEIGHT`], clamped to what the primary monitor can actually show.
+///
+/// **`inner_size` is in logical pixels, and Windows display scaling multiplies
+/// them.** At 125% — Microsoft's *recommended* setting on most 13-15" 1080p
+/// laptops — an 880 logical window is ~1100 physical and its bottom falls off
+/// the screen. With `resizable(false)` and `body { overflow: hidden }` the user
+/// then cannot reach `#settings-cog` and has no scrollbar, no resize grip and no
+/// visible symptom: exactly the failure raising the height was meant to fix,
+/// moved from "everyone, under stress" to "anyone on a scaled laptop, always".
+///
+/// Monitor size is physical, so it is converted back through `scale_factor`
+/// before comparing. When the clamp bites, `body`'s `overflow-y: auto` (styles.css)
+/// is what keeps the clipped content reachable — the two are a pair, and
+/// removing either re-opens this.
+fn window_height(app: &AppHandle) -> f64 {
+    let available = app
+        .primary_monitor()
+        .ok()
+        .flatten()
+        .map(|m| m.size().height as f64 / m.scale_factor() - CHROME_ALLOWANCE)
+        // No monitor information is not a reason to fail to open a window;
+        // the designed height is the best guess available.
+        .unwrap_or(WINDOW_HEIGHT);
+
+    WINDOW_HEIGHT.min(available).max(WINDOW_MIN_HEIGHT)
+}
+
 /// Shows the settings window, recreating it if a previous close destroyed it
 /// (§4.10).
 pub fn show_window(app: &AppHandle) {
@@ -195,7 +247,7 @@ pub fn show_window(app: &AppHandle) {
 
     let built = tauri::WebviewWindowBuilder::new(app, "main", tauri::WebviewUrl::default())
         .title("mugon")
-        .inner_size(460.0, 700.0)
+        .inner_size(WINDOW_WIDTH, window_height(app))
         .resizable(false)
         .maximizable(false)
         // Explicit rather than relying on Tauri's default (which is `true`

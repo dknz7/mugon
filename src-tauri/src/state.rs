@@ -53,7 +53,7 @@ use crate::audio::meter::MeterHandle;
 use crate::audio::thread::{MeterTap, MicHandle};
 use crate::audio::{AudioError, DeviceInfo, MicBackend};
 use crate::config::{Config, NotificationPrefs};
-use crate::hotkey::recorder::Recorder;
+use crate::hotkey::{keys, Hotkey};
 use crate::modes::{Mode, ModeMachine};
 
 /// The one event carrying [`AppState`]. Task 14's frontend re-renders
@@ -173,23 +173,32 @@ pub struct AppState {
     pub mode: Mode,
     pub muted: bool,
     pub volume: f32,
-    pub hotkey_display: Option<String>,
     pub hotkey_is_bare_printable: bool,
+    /// The binding broken into the parts the picker's controls bind to.
+    ///
+    /// There is deliberately **no** `hotkey_display` alongside this. Task 17
+    /// added these parts expecting the two to coexist, and the formatted label
+    /// turned out to have no remaining consumer: the combo the user reads is
+    /// composed into [`Self::hotkey_status`] by [`Core::hotkey_status`]. A
+    /// second `String` built on every push-to-talk key edge for nobody is the
+    /// same cost this struct evicted the device list over.
+    pub hotkey: Option<HotkeyParts>,
+    /// The `HOTKEY STATUS` line and its kind. See [`Core::hotkey_status`].
+    pub hotkey_status: HotkeyStatus,
     pub manual_controls_enabled: bool,
     pub notifications: NotificationPrefs,
     pub autostart: bool,
-    pub recording: bool,
     /// The last device failure, or `None` if the last audio call succeeded.
     /// One field, no history, no severity — enough for the UI to say "that
     /// didn't work, and here's why" instead of nothing at all.
     ///
     /// **Dismissal semantics, because they are not what a reader assumes:**
     /// this clears only when a *subsequent fallible operation succeeds* — an
-    /// audio call, or the autostart registry write. Commands that cannot fail
-    /// — `set_notification_prefs`, `clear_hotkey`, `begin_hotkey_recording`,
-    /// `cancel_hotkey_recording` — leave it exactly as they found it, so an
+    /// audio call, the autostart registry write, or a `set_hotkey` that
+    /// validates. Commands that cannot fail — `set_notification_prefs`,
+    /// `list_bindable_keys` — leave it exactly as they found it, so an
     /// error stays pinned across any number of them until something actually
-    /// talks to the device again. There is no user-dismiss path and no
+    /// succeeds. There is no user-dismiss path and no
     /// timestamp. Task 14 should render it as "the last thing that went wrong",
     /// not as "something is wrong right now".
     pub last_error: Option<String>,
@@ -212,6 +221,45 @@ pub struct AppState {
     pub hook_error: Option<String>,
 }
 
+/// Which of the four `HOTKEY STATUS` states applies.
+///
+/// **Travels alongside the label rather than being derived from it.** The
+/// frontend styles off this; without it the only way to colour the line is to
+/// prefix-match the label, which turns [`HotkeyStatus::label`] into an
+/// undeclared enum — reword the copy and the colouring silently stops applying,
+/// with every test on both sides still green. task-14-amendment §2 forbids the
+/// frontend parsing Rust-owned display strings, and this is what makes obeying
+/// it possible.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum HotkeyStatusKind {
+    Inactive,
+    NotSet,
+    Bound,
+    Confirmed,
+}
+
+/// The `HOTKEY STATUS` line: what to render, and what it means.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct HotkeyStatus {
+    pub kind: HotkeyStatusKind,
+    pub label: String,
+}
+
+/// A binding as the picker's controls see it: four booleans and a key name.
+///
+/// The key travels by **name**, never as a raw VK, for the same reason the
+/// config file does — a VK is meaningless to the frontend, and a name is
+/// exactly what `list_bindable_keys` offers and what `set_hotkey` accepts, so
+/// the value round-trips through the dropdown unchanged.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct HotkeyParts {
+    pub ctrl: bool,
+    pub alt: bool,
+    pub shift: bool,
+    pub win: bool,
+    pub key: String,
+}
+
 pub struct Core {
     pub machine: ModeMachine<Mic>,
     pub config: Config,
@@ -220,7 +268,6 @@ pub struct Core {
     /// which is what lets the tests below exercise the persisting paths
     /// without writing to the developer's real `%APPDATA%`.
     pub config_dir: PathBuf,
-    pub recorder: Recorder,
     /// See [`AppState::last_error`] for the dismissal semantics.
     pub last_error: Option<String>,
     /// See [`AppState::hook_error`]. Set once, by the hook thread, if
@@ -244,16 +291,25 @@ impl Core {
             mode: self.machine.mode(),
             muted: self.machine.mic().is_muted().unwrap_or(false),
             volume: self.machine.mic().volume().unwrap_or(1.0),
-            hotkey_display: self.config.hotkey.map(|h| h.display()),
             hotkey_is_bare_printable: self
                 .config
                 .hotkey
                 .map(|h| h.is_bare_printable())
                 .unwrap_or(false),
+            // `vk_to_name` cannot fail here: a `Hotkey` only ever exists via
+            // `set_hotkey` or `Deserialize`, and both resolve the name through
+            // this same table before constructing one.
+            hotkey: self.config.hotkey.map(|h| HotkeyParts {
+                ctrl: h.ctrl,
+                alt: h.alt,
+                shift: h.shift,
+                win: h.win,
+                key: keys::vk_to_name(h.vk).unwrap_or("?").to_string(),
+            }),
+            hotkey_status: self.hotkey_status(),
             manual_controls_enabled: self.machine.manual_controls_enabled(),
             notifications: self.config.notifications.clone(),
             autostart: self.config.autostart,
-            recording: self.recorder.is_active(),
             last_error: self.last_error.clone(),
             hook_error: self.hook_error.clone(),
         }
@@ -351,6 +407,117 @@ impl Core {
         // `a_failed_selection_still_persists_the_users_choice_and_records_why`.
         // The select's own reason is the more useful one, so it stands.
         self.machine.mic().is_muted().unwrap_or(false)
+    }
+
+    /// The picker's write path (Task 17), and the **second enforcement point**
+    /// for "a binding's key is never a modifier". The first is `Hotkey`'s
+    /// `Deserialize`, which guards the config file; this guards IPC. Both
+    /// entrances to the same field need the same rule, or the one without it
+    /// becomes the way around the other.
+    ///
+    /// `key: None` clears the binding.
+    ///
+    /// **Every call resets [`Config::hotkey_confirmed`]**, including one that
+    /// merely adds a modifier to an existing key: `Ctrl + F16` is a different
+    /// combo from `F16` and has not been observed just because `F16` was.
+    ///
+    /// Split out from the command for the same reason [`Self::apply_mode`] is —
+    /// it makes the sequencing testable rather than reachable only through IPC.
+    pub fn set_hotkey(
+        &mut self,
+        ctrl: bool,
+        alt: bool,
+        shift: bool,
+        win: bool,
+        key: Option<&str>,
+    ) -> Result<(), String> {
+        // Routed through `last_error` as well as the `Result`, exactly as
+        // `set_autostart` does: the frontend has no error surface of its own —
+        // the banner renders `last_error` — so a rejection returned and nowhere
+        // else is as silent as no rejection at all.
+        let binding = match self.validate(ctrl, alt, shift, win, key) {
+            Ok(binding) => {
+                self.last_error = None;
+                binding
+            }
+            Err(e) => {
+                self.last_error = Some(e.clone());
+                return Err(e);
+            }
+        };
+        self.config.hotkey = binding;
+        self.config.hotkey_confirmed = false;
+        self.persist();
+        Ok(())
+    }
+
+    /// Resolves a picker selection into a binding, or says why it cannot.
+    ///
+    /// Split out to keep [`Self::set_hotkey`] legible now that it also does
+    /// `last_error` bookkeeping around the write — the validation rules and the
+    /// error routing read as two separate things because they are. Taking
+    /// `&self` also makes it structurally unable to touch stored state on the
+    /// way to a rejection.
+    fn validate(
+        &self,
+        ctrl: bool,
+        alt: bool,
+        shift: bool,
+        win: bool,
+        key: Option<&str>,
+    ) -> Result<Option<Hotkey>, String> {
+        let Some(name) = key else {
+            return Ok(None);
+        };
+        let vk = keys::name_to_vk(name).ok_or_else(|| format!("{name:?} is not a bindable key"))?;
+        if keys::is_modifier(vk) {
+            return Err(format!("{name:?} is a modifier and cannot be the bound key"));
+        }
+        Ok(Some(Hotkey { ctrl, alt, shift, win, vk }))
+    }
+
+    /// Records that the hook has actually observed the bound combo firing.
+    ///
+    /// Returns whether this call was the *transition*. That return is
+    /// load-bearing: without it the caller would persist on every matching
+    /// keypress, which in Push to Talk is a config write per key edge — two per
+    /// press, for the life of the binding.
+    pub fn confirm_hotkey(&mut self) -> bool {
+        if self.config.hotkey.is_none() || self.config.hotkey_confirmed {
+            return false;
+        }
+        self.config.hotkey_confirmed = true;
+        self.persist();
+        true
+    }
+
+    /// The `HOTKEY STATUS` line, composed here rather than in TypeScript
+    /// because task-14-amendment §2 puts display strings on the Rust side: the
+    /// frontend renders them and never parses them. [`HotkeyStatus::kind`] is
+    /// what makes obeying that possible — it gives the frontend something to
+    /// switch on that is not the label's wording.
+    ///
+    /// **`Inactive` outranks everything.** With no hook there is no path by
+    /// which any binding can ever be confirmed, so prompting the user to press
+    /// a key would be instructing them to do something that cannot work. It
+    /// deliberately overlaps the error banner — the banner is easy to miss, and
+    /// this is the row the user is actually looking at.
+    pub fn hotkey_status(&self) -> HotkeyStatus {
+        let (kind, label) = if self.hook_error.is_some() {
+            (HotkeyStatusKind::Inactive, "Inactive — keyboard hook blocked".to_string())
+        } else {
+            match self.config.hotkey {
+                None => (HotkeyStatusKind::NotSet, "Not set".to_string()),
+                Some(_) if self.config.hotkey_confirmed => {
+                    (HotkeyStatusKind::Confirmed, "Confirmed".to_string())
+                }
+                Some(hk) => (
+                    HotkeyStatusKind::Bound,
+                    format!("Bound — press {} to confirm", hk.display()),
+                ),
+            }
+        };
+        HotkeyStatus { kind, label }
     }
 
     /// Persists config. Failures are logged, never fatal — a read-only
@@ -463,7 +630,6 @@ pub(crate) fn fake_core(mode: Mode) -> (Core, tempfile::TempDir) {
         machine: ModeMachine::new(Mic::Live(handle), mode),
         config: Config { mode, ..Config::default() },
         config_dir: dir.path().to_path_buf(),
-        recorder: Recorder::default(),
         last_error: None,
         hook_error: None,
     };
@@ -480,10 +646,183 @@ mod tests {
             machine: ModeMachine::new(Mic::Unavailable, Mode::MuteToggle),
             config: Config::default(),
             config_dir: std::env::temp_dir().join("mugon-test-never-written"),
-            recorder: Recorder::default(),
             last_error: None,
             hook_error: None,
         }
+    }
+
+    // ---- Task 17: the hotkey picker ----
+
+    #[test]
+    fn set_hotkey_stores_and_persists_a_binding() {
+        let (mut core, dir) = fake_core(Mode::MuteToggle);
+
+        core.set_hotkey(true, false, true, false, Some("F16")).unwrap();
+
+        assert_eq!(
+            core.config.hotkey.map(|h| h.display()).as_deref(),
+            Some("Ctrl + Shift + F16")
+        );
+        assert_eq!(
+            Config::load(dir.path()).hotkey.map(|h| h.display()).as_deref(),
+            Some("Ctrl + Shift + F16"),
+            "the choice must survive to the next launch"
+        );
+    }
+
+    #[test]
+    fn set_hotkey_with_no_key_clears_the_binding() {
+        let (mut core, dir) = fake_core(Mode::MuteToggle);
+        core.set_hotkey(false, false, false, false, Some("F16")).unwrap();
+
+        core.set_hotkey(false, false, false, false, None).unwrap();
+
+        assert_eq!(core.config.hotkey, None);
+        assert_eq!(Config::load(dir.path()).hotkey, None, "clearing must persist too");
+    }
+
+    /// The same invariant `Hotkey`'s `Deserialize` enforces at the config-file
+    /// entrance, enforced at the IPC entrance. A binding whose key is a
+    /// modifier fires the bound action on every shortcut pressed all day.
+    #[test]
+    fn set_hotkey_rejects_a_modifier_as_the_bound_key() {
+        let (mut core, _dir) = fake_core(Mode::MuteToggle);
+
+        assert!(core.set_hotkey(false, false, false, false, Some("LeftCtrl")).is_err());
+
+        assert_eq!(core.config.hotkey, None, "a rejected binding must not be stored");
+    }
+
+    #[test]
+    fn set_hotkey_rejects_a_key_that_is_not_offered() {
+        let (mut core, _dir) = fake_core(Mode::MuteToggle);
+
+        assert!(core.set_hotkey(false, false, false, false, Some("Nonsense")).is_err());
+        assert!(
+            core.set_hotkey(false, false, false, false, Some("Escape")).is_err(),
+            "Escape is the universal way out and is not bindable"
+        );
+    }
+
+    /// A new binding has never been seen. Carrying the old confirmation over
+    /// would have the UI claim "Confirmed" about a key nothing has observed.
+    #[test]
+    fn set_hotkey_resets_the_confirmation() {
+        let (mut core, _dir) = fake_core(Mode::MuteToggle);
+        core.set_hotkey(false, false, false, false, Some("F16")).unwrap();
+        core.confirm_hotkey();
+
+        core.set_hotkey(false, false, false, false, Some("F17")).unwrap();
+
+        assert!(!core.config.hotkey_confirmed);
+    }
+
+    /// Guards the persist. Without the transition check every press of a
+    /// confirmed hotkey rewrites `config.json` — in Push to Talk that is a disk
+    /// write per keypress, twice.
+    #[test]
+    fn confirming_is_a_one_time_transition() {
+        let (mut core, dir) = fake_core(Mode::MuteToggle);
+        core.set_hotkey(false, false, false, false, Some("F16")).unwrap();
+
+        assert!(core.confirm_hotkey(), "the first sighting confirms");
+        assert!(!core.confirm_hotkey(), "a second sighting changes nothing");
+
+        assert!(Config::load(dir.path()).hotkey_confirmed, "confirmation must survive a restart");
+    }
+
+    #[test]
+    fn confirming_without_a_binding_does_nothing() {
+        let (mut core, _dir) = fake_core(Mode::MuteToggle);
+
+        assert!(!core.confirm_hotkey());
+        assert!(!core.config.hotkey_confirmed);
+    }
+
+    /// A rejected binding must reach the user. `set_hotkey` returns the reason,
+    /// but the frontend has no error surface of its own — the banner renders
+    /// `last_error`, so a `Result` nobody routes there is exactly as silent as
+    /// no `Result` at all. Same rule `set_autostart` follows.
+    #[test]
+    fn a_rejected_binding_records_why_in_last_error() {
+        let (mut core, _dir) = fake_core(Mode::MuteToggle);
+
+        assert!(core.set_hotkey(false, false, false, false, Some("Nonsense")).is_err());
+
+        let message = core.last_error.as_deref().expect("the rejection must be visible");
+        assert!(message.contains("Nonsense"), "the message must name the key: {message}");
+    }
+
+    #[test]
+    fn a_successful_binding_clears_a_previous_rejection() {
+        let (mut core, _dir) = fake_core(Mode::MuteToggle);
+        let _ = core.set_hotkey(false, false, false, false, Some("Nonsense"));
+
+        core.set_hotkey(false, false, false, false, Some("F16")).unwrap();
+
+        assert_eq!(core.last_error, None);
+    }
+
+    #[test]
+    fn hotkey_status_reads_not_set_with_no_binding() {
+        let (core, _dir) = fake_core(Mode::MuteToggle);
+        assert_eq!(core.hotkey_status().label, "Not set");
+        assert_eq!(core.hotkey_status().kind, HotkeyStatusKind::NotSet);
+    }
+
+    /// The kind is what the frontend styles off. It exists so the accent colour
+    /// is not derived by prefix-matching the label — reword the label and the
+    /// colouring would silently stop applying, with every test still green.
+    #[test]
+    fn every_hotkey_status_kind_travels_with_its_label() {
+        let (mut core, _dir) = fake_core(Mode::MuteToggle);
+        assert_eq!(core.hotkey_status().kind, HotkeyStatusKind::NotSet);
+
+        core.set_hotkey(false, false, false, false, Some("F16")).unwrap();
+        assert_eq!(core.hotkey_status().kind, HotkeyStatusKind::Bound);
+
+        core.confirm_hotkey();
+        assert_eq!(core.hotkey_status().kind, HotkeyStatusKind::Confirmed);
+
+        core.hook_error = Some("blocked".into());
+        assert_eq!(core.hotkey_status().kind, HotkeyStatusKind::Inactive);
+    }
+
+    /// The prompt carries the combo so it reads as an instruction rather than a
+    /// label — the user has to know *what* to press.
+    #[test]
+    fn hotkey_status_prompts_for_a_confirming_press() {
+        let (mut core, _dir) = fake_core(Mode::MuteToggle);
+        core.set_hotkey(false, false, false, false, Some("F16")).unwrap();
+
+        assert_eq!(core.hotkey_status().label, "Bound — press F16 to confirm");
+    }
+
+    #[test]
+    fn hotkey_status_reads_confirmed_once_the_hook_has_seen_it() {
+        let (mut core, _dir) = fake_core(Mode::MuteToggle);
+        core.set_hotkey(false, false, false, false, Some("F16")).unwrap();
+
+        core.confirm_hotkey();
+
+        assert_eq!(core.hotkey_status().label, "Confirmed");
+    }
+
+    /// Precedence, and the reason it exists: with a dead hook, confirmation is
+    /// impossible. Telling the user to press F16 to confirm would be
+    /// instructing them to do something that cannot work, forever.
+    #[test]
+    fn a_dead_hook_outranks_every_other_hotkey_status() {
+        let (mut core, _dir) = fake_core(Mode::MuteToggle);
+        core.hook_error = Some("Windows blocked the keyboard hook".into());
+
+        assert_eq!(core.hotkey_status().label, "Inactive — keyboard hook blocked");
+
+        core.set_hotkey(false, false, false, false, Some("F16")).unwrap();
+        assert_eq!(core.hotkey_status().label, "Inactive — keyboard hook blocked");
+
+        core.confirm_hotkey();
+        assert_eq!(core.hotkey_status().label, "Inactive — keyboard hook blocked");
     }
 
     /// Pins the exact wire shape Task 14's frontend mirrors field-for-field.
@@ -501,14 +840,14 @@ mod tests {
             [
                 "autostart",
                 "hook_error",
-                "hotkey_display",
+                "hotkey",
                 "hotkey_is_bare_printable",
+                "hotkey_status",
                 "last_error",
                 "manual_controls_enabled",
                 "mode",
                 "muted",
                 "notifications",
-                "recording",
                 "selected_device",
                 "volume",
             ]
@@ -517,6 +856,51 @@ mod tests {
             !object.contains_key("devices"),
             "the device list must not ride on the hot snapshot — it costs a full \
              COM enumeration on every push-to-talk keypress. Use `list_devices`."
+        );
+    }
+
+    /// The nested shapes the picker binds to, pinned by **value**, not just by
+    /// key.
+    ///
+    /// `app_state_wire_format_is_pinned` above checks top-level field names
+    /// only, which leaves the contract this task actually depends on unguarded:
+    /// the frontend switches its styling on `hotkey_status.kind` and its
+    /// controls on `hotkey.*`. Add a `#[serde(rename_all)]` or rename a variant
+    /// and everything still compiles, every other test stays green, and the
+    /// accent colour silently stops applying — the exact failure mode the
+    /// `HotkeyStatus { kind, label }` split was introduced to remove, relocated
+    /// from the label's wording to the variant's name.
+    #[test]
+    fn the_hotkey_wire_shapes_the_picker_switches_on_are_pinned() {
+        let mut core = unavailable_core();
+
+        let value = serde_json::to_value(core.snapshot()).unwrap();
+        assert_eq!(value["hotkey_status"]["kind"], "NotSet");
+        assert_eq!(value["hotkey_status"]["label"], "Not set");
+        assert_eq!(value["hotkey"], serde_json::Value::Null);
+
+        core.config.hotkey =
+            Some(Hotkey { ctrl: true, alt: false, shift: false, win: false, vk: 0x7F });
+        let value = serde_json::to_value(core.snapshot()).unwrap();
+
+        assert_eq!(value["hotkey_status"]["kind"], "Bound");
+        let hotkey = value["hotkey"].as_object().expect("hotkey must be an object");
+        let mut keys: Vec<&str> = hotkey.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(keys, ["alt", "ctrl", "key", "shift", "win"]);
+        assert_eq!(hotkey["key"], "F16");
+        assert_eq!(hotkey["ctrl"], true);
+
+        core.config.hotkey_confirmed = true;
+        assert_eq!(
+            serde_json::to_value(core.snapshot()).unwrap()["hotkey_status"]["kind"],
+            "Confirmed"
+        );
+
+        core.hook_error = Some("blocked".into());
+        assert_eq!(
+            serde_json::to_value(core.snapshot()).unwrap()["hotkey_status"]["kind"],
+            "Inactive"
         );
     }
 
@@ -529,15 +913,34 @@ mod tests {
         assert_eq!(snapshot.volume, 1.0);
         assert_eq!(snapshot.mode, Mode::MuteToggle);
         assert!(snapshot.manual_controls_enabled);
-        assert!(!snapshot.recording);
+        assert_eq!(snapshot.hotkey, None);
+    }
+
+    /// The picker's controls render off these parts. They exist so the four
+    /// chips and the dropdown have raw values to bind to — the alternative is
+    /// recovering them by parsing a formatted label in TypeScript, which
+    /// task-14-amendment §2 forbids.
+    #[test]
+    fn snapshot_carries_the_binding_in_parts_for_the_picker() {
+        let mut core = unavailable_core();
+        core.config.hotkey =
+            Some(Hotkey { ctrl: true, alt: false, shift: true, win: false, vk: 0x7F });
+
+        let parts = core.snapshot().hotkey.expect("a bound hotkey must reach the picker");
+
+        assert!(parts.ctrl);
+        assert!(!parts.alt);
+        assert!(parts.shift);
+        assert!(!parts.win);
+        assert_eq!(parts.key, "F16");
     }
 
     #[test]
-    fn snapshot_reports_the_recorded_hotkey_and_its_bare_printable_warning() {
+    fn snapshot_reports_the_bound_hotkey_and_its_bare_printable_warning() {
         let mut core = unavailable_core();
         core.config.hotkey = Some(Hotkey { ctrl: false, alt: false, shift: false, win: false, vk: 0x4D });
         let snapshot = core.snapshot();
-        assert_eq!(snapshot.hotkey_display.as_deref(), Some("M"));
+        assert_eq!(snapshot.hotkey.map(|h| h.key).as_deref(), Some("M"));
         assert!(snapshot.hotkey_is_bare_printable, "bare M must carry the warning flag");
     }
 

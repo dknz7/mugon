@@ -8,7 +8,7 @@
 //! | `mugon-audio` | the `!Send` Core Audio `Endpoint` and the WASAPI capture stream | MTA; serves commands over a channel ([`audio::thread`]) |
 //! | `mugon-audio-startup` | nothing after it reports | throwaway; exists only so a wedged audio service becomes a timeout instead of a hang |
 //! | `mugon-hook` | the `WH_KEYBOARD_LL` hook and its message pump | [`hotkey::hook::install`] blocks forever by design |
-//! | `mugon-hook-dispatch` | routing hook events into the recorder or the mode machine | **must not** be the hook thread: a slow Core Audio call there makes Windows silently uninstall the hook |
+//! | `mugon-hook-dispatch` | routing hook events into the mode machine | **must not** be the hook thread: a slow Core Audio call there makes Windows silently uninstall the hook |
 //! | `mugon-meter` | the 30Hz `level` poll loop | polls through a `MeterTap`, never touches the `Core` lock; exists only while the settings window does |
 //! | `mugon-emergency-unmute` | a throwaway `Endpoint` | panic-hook only ([`emergency_unmute`]); never touches `Core`, because the panicking thread may be holding it |
 //! | *(Windows audio service)* | nothing | not ours: the `IMMNotificationClient` callback ([`audio::hotplug`]) runs on an arbitrary COM thread. It holds only a channel sender and an `AppHandle`, never blocks, and never touches an `Endpoint` or the `Core` lock |
@@ -29,18 +29,14 @@ pub mod tray;
 use std::sync::mpsc;
 use std::sync::Mutex;
 
-use tauri::{AppHandle, Emitter, Manager};
+use tauri::{AppHandle, Manager};
 
 use audio::meter::MeterHandle;
 use audio::MicBackend;
 use config::{Config, NotificationPrefs};
 use hotkey::hook::{self, HookEvent};
-use hotkey::recorder::{Recorder, RecorderOutcome};
 use modes::{KeyEdge, KeyObservation, Mode, ModeMachine};
 use state::{emit_state, lock_or_recover, Core, Meter, Mic, Shared};
-
-/// Live combo feedback while the hotkey recorder is running (DESIGN.md §3).
-const HOTKEY_RECORDING: &str = "hotkey-recording";
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -93,7 +89,6 @@ pub fn run() {
             machine,
             config,
             config_dir,
-            recorder: Recorder::default(),
             last_error,
             // Set only if the hook thread below fails to install.
             hook_error: None,
@@ -106,9 +101,8 @@ pub fn run() {
             commands::set_mode,
             commands::set_volume,
             commands::toggle_mute,
-            commands::begin_hotkey_recording,
-            commands::cancel_hotkey_recording,
-            commands::clear_hotkey,
+            commands::list_bindable_keys,
+            commands::set_hotkey,
             commands::set_notification_prefs,
             commands::set_autostart,
         ])
@@ -385,12 +379,11 @@ pub(crate) fn stop_metering(app: &AppHandle) {
 enum Follow {
     Nothing,
     Emit,
-    Recording(Option<String>),
     MuteChanged { mode: Mode, muted: bool, prefs: NotificationPrefs },
 }
 
-/// Consumes hook events on a worker thread and routes them to the recorder or
-/// the mode machine.
+/// Consumes hook events on a worker thread and routes them into the mode
+/// machine.
 ///
 /// Runs off both the UI thread and the hook thread. The hook thread in
 /// particular must never do this work: a slow Core Audio call inside
@@ -405,7 +398,7 @@ fn dispatch_hook_events(app: AppHandle, rx: mpsc::Receiver<HookEvent>) {
         };
 
         // Explicit block rather than passing the guard inline: the guard must
-        // be visibly dead before the `match` below, which re-enters the lock.
+        // be visibly dead before `run_follow` below, which re-enters the lock.
         let follow = {
             let mut c = lock_or_recover(&core);
             handle_hook_event(&mut c, &ev)
@@ -421,12 +414,6 @@ fn run_follow(app: &AppHandle, follow: Follow) {
     match follow {
         Follow::Nothing => {}
         Follow::Emit => emit_state(app),
-        Follow::Recording(combo) => {
-            let _ = app.emit(
-                HOTKEY_RECORDING,
-                serde_json::json!({ "active": true, "combo": combo }),
-            );
-        }
         Follow::MuteChanged { mode, muted, prefs } => {
             notify::on_mute_change(app, mode, muted, &prefs);
             tray::update_icon(app, muted);
@@ -507,7 +494,7 @@ fn watchdog_poll(c: &mut Core, physically_down: impl Fn(u16) -> bool) -> (bool, 
 /// as a plain function of the state and the event.
 ///
 /// Split out from the loop for two reasons. It is the highest-risk logic in
-/// the wiring — recorder-versus-hotkey routing, the mute-change comparison,
+/// the wiring — binding match, confirmation, the mute-change comparison,
 /// and which follow-up fires — and inline in a `while let` around an
 /// `AppHandle` it would be untestable. And the split is what makes the lock
 /// discipline checkable by inspection: everything in here runs under the lock,
@@ -516,21 +503,23 @@ fn watchdog_poll(c: &mut Core, physically_down: impl Fn(u16) -> bool) -> (bool, 
 /// Takes `&mut Core` rather than the guard so tests can call it against a
 /// fake-backed `Core` (see [`state::fake_core`]).
 fn handle_hook_event(c: &mut Core, ev: &HookEvent) -> Follow {
-    if c.recorder.is_active() {
-        return match c.recorder.feed(ev) {
-            RecorderOutcome::Committed(hk) => {
-                c.config.hotkey = Some(hk);
-                c.persist();
-                Follow::Emit
-            }
-            RecorderOutcome::Cancelled => Follow::Emit,
-            RecorderOutcome::InProgress(partial) => Follow::Recording(partial.map(|h| h.display())),
-            RecorderOutcome::Idle => Follow::Nothing,
-        };
-    }
-
     if !c.config.hotkey.is_some_and(|binding| hook::matches(&binding, ev)) {
         return Follow::Nothing;
+    }
+
+    // Task 17: the hook has now seen the bound combo actually fire, which is
+    // what moves `HOTKEY STATUS` off `Bound`. Key-down only — `hook::matches`
+    // compares the modifier set exactly, and users routinely release Ctrl before
+    // the key, so the key-up event often carries no modifiers and matches
+    // nothing.
+    //
+    // Nothing is done with the return here because every reachable `apply_edge`
+    // result below already emits: a working endpoint reports `MuteChanged`, and
+    // one that has stopped answering reports `Emit`. If that ever stops being
+    // true, a first sighting would silently leave the status line reading
+    // "press … to confirm" until something unrelated pushed state.
+    if ev.down {
+        c.confirm_hotkey();
     }
 
     apply_edge(c, if ev.down { KeyEdge::Down } else { KeyEdge::Up })
@@ -651,46 +640,42 @@ mod tests {
         assert!(matches!(handle_hook_event(&mut core, &ev(F13, true)), Follow::Nothing));
     }
 
+    /// Task 17. Observing the bound combo fire is the only proof mugon has that
+    /// the key actually reaches it — the one thing recording provided that a
+    /// dropdown cannot. It drives `HOTKEY STATUS` from `Bound` to `Confirmed`.
     #[test]
-    fn committing_a_recording_stores_and_persists_the_new_binding() {
-        let (mut core, dir) = fake_core(Mode::MuteToggle);
-        core.recorder.start();
-
-        assert!(matches!(
-            handle_hook_event(&mut core, &ev(F13, true)),
-            Follow::Recording(Some(_))
-        ));
-        assert!(matches!(handle_hook_event(&mut core, &ev(F13, false)), Follow::Emit));
-
-        assert_eq!(core.config.hotkey, Some(binding()));
-        assert!(!core.recorder.is_active(), "committing must stop the recorder");
-        assert_eq!(
-            config::Config::load(dir.path()).hotkey,
-            Some(binding()),
-            "the new binding must survive to the next launch"
-        );
-    }
-
-    /// While recording, the bound key must reach the recorder rather than
-    /// toggling the mic — otherwise re-binding an existing hotkey mutes you.
-    #[test]
-    fn a_press_during_recording_does_not_reach_the_mode_machine() {
-        let (mut core, _dir) = bound_core(Mode::PushToTalk);
-        let before = core.machine.mic().is_muted().unwrap();
-        core.recorder.start();
+    fn a_matching_press_confirms_the_binding() {
+        let (mut core, _dir) = bound_core(Mode::MuteToggle);
+        assert!(!core.config.hotkey_confirmed, "a fresh binding starts unconfirmed");
 
         let _ = handle_hook_event(&mut core, &ev(F13, true));
-        assert_eq!(core.machine.mic().is_muted().unwrap(), before, "the mic must not move");
+
+        assert!(core.config.hotkey_confirmed);
     }
 
     #[test]
-    fn escape_during_recording_cancels_and_pushes_state() {
+    fn a_non_matching_press_never_confirms() {
         let (mut core, _dir) = bound_core(Mode::MuteToggle);
-        core.recorder.start();
 
-        assert!(matches!(handle_hook_event(&mut core, &ev(0x1B, true)), Follow::Emit));
-        assert!(!core.recorder.is_active());
-        assert_eq!(core.config.hotkey, Some(binding()), "the old binding must survive a cancel");
+        let _ = handle_hook_event(&mut core, &ev(0x4D, true));
+
+        assert!(!core.config.hotkey_confirmed, "only the bound combo is proof");
+    }
+
+    /// Confirmation hangs off **key-down** deliberately. `hook::matches`
+    /// compares the modifier set exactly, and on the release of `Ctrl + F16` the
+    /// user has very often let Ctrl go first — so the key-up event carries
+    /// `ctrl: false` and matches nothing. Key-down is the edge that reliably
+    /// carries the whole combo.
+    #[test]
+    fn a_release_whose_modifiers_already_lifted_does_not_confirm() {
+        let (mut core, _dir) = fake_core(Mode::MuteToggle);
+        core.config.hotkey =
+            Some(Hotkey { ctrl: true, alt: false, shift: false, win: false, vk: F13 });
+
+        let _ = handle_hook_event(&mut core, &ev(F13, false));
+
+        assert!(!core.config.hotkey_confirmed);
     }
 
     // --- Hook health (§7) ---

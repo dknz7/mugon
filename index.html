@@ -68,11 +68,40 @@
 
         <div class="section">
           <span class="field-label">Hotkey</span>
-          <div class="hotkey-row">
-            <span id="hotkey-display" class="hotkey-display">Ctrl + Alt + M</span>
-            <button id="hotkey-record" class="btn" type="button">Record</button>
+          <!-- Modifier chips are real checkboxes so the label toggles them and
+               the keyboard reaches them; the chip look is CSS on the label. -->
+          <div class="modifier-row">
+            <input id="mod-ctrl" class="chip-input" type="checkbox" />
+            <label class="chip" for="mod-ctrl">Ctrl</label>
+            <input id="mod-alt" class="chip-input" type="checkbox" />
+            <label class="chip" for="mod-alt">Alt</label>
+            <input id="mod-shift" class="chip-input" type="checkbox" />
+            <label class="chip" for="mod-shift">Shift</label>
+            <input id="mod-win" class="chip-input" type="checkbox" />
+            <label class="chip" for="mod-win">Win</label>
+          </div>
+          <!-- `.select-wrap` is what draws the chevron (styles.css) — a bare
+               <select> has `appearance: none` and no affordance at all. -->
+          <div class="select-wrap">
+            <!-- Options are filled from `list_bindable_keys` — the same list the
+                 backend accepts. Nothing here is hardcoded. -->
+            <select id="hotkey-key" aria-label="Hotkey key"></select>
+          </div>
+          <div class="hotkey-status-row">
+            <!-- The "HOTKEY STATUS:" label is static markup; only the value
+                 comes from Rust, and it is rendered verbatim. Composing the two
+                 in TypeScript would be the frontend building a display string,
+                 which task-14-amendment §2 forbids. -->
+            <p class="hotkey-status">
+              <span class="hotkey-status-label">HOTKEY STATUS:</span>
+              <span id="hotkey-status">Not set</span>
+            </p>
             <button id="hotkey-clear" class="btn btn-quiet" type="button">Clear</button>
           </div>
+          <p id="hotkey-hint" class="hotkey-hint" hidden>
+            The hotkey does not fire while this window is focused — click another
+            window, or close mugon to the tray.
+          </p>
           <p id="hotkey-warning" class="warning" hidden>
             A bare printable key is bound — in Push-to-Talk, holding it repeats that
             character into whatever is focused (e.g. hold V to talk and you type

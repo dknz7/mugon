@@ -61,7 +61,7 @@ JavaScript.
 |---|---|---|
 | `main.rs` | Tauri setup, app lifecycle, wiring | all |
 | `audio.rs` | Core Audio: enumerate endpoints, get/set mute, get/set volume, peak metering, hotplug notifications | `windows` |
-| `hotkey.rs` | `WH_KEYBOARD_LL` hook, key-state tracking, combo matching, record mode | `windows` |
+| `hotkey.rs` | `WH_KEYBOARD_LL` hook, key-state tracking, combo matching, the bindable-key table | `windows` |
 | `modes.rs` | Mode state machine. The sole authority on what the mute state should be. | `audio` (trait) |
 | `notify.rs` | Toasts and the optional audible beep | tauri plugin, `windows` |
 | `config.rs` | Settings serialization and persistence | `serde` |
@@ -97,9 +97,8 @@ testable against a fake device.
 | `set_mode` | `(mode: Mode)` |
 | `set_volume` | `(level: f32)` — 0.0–1.0 |
 | `toggle_mute` | `()` — for the UI toggle switch |
-| `begin_hotkey_recording` | `()` |
-| `cancel_hotkey_recording` | `()` |
-| `clear_hotkey` | `()` |
+| `list_bindable_keys` | `() -> Vec<KeyGroup>` — the picker's dropdown, static for the process's life |
+| `set_hotkey` | `(ctrl, alt, shift, win, key: Option<String>) -> Result<(), String>` — `None` clears |
 | `set_notification_prefs` | `(toast: bool, sound: bool)` |
 | `set_autostart` | `(enabled: bool)` |
 
@@ -110,7 +109,6 @@ testable against a fake device.
 | `state-changed` | `AppState` | On change |
 | `level` | `{ peak_db: f32 }` | ~30 Hz, only while window exists |
 | `devices-changed` | `Vec<DeviceInfo>` | On hotplug |
-| `hotkey-recording` | `{ active: bool, combo: Option<Hotkey> }` | Live during recording |
 
 `AppState` is small enough that one fat `state-changed` event is simpler and
 cheaper than a family of granular ones.
@@ -200,14 +198,44 @@ struct Hotkey { ctrl: bool, alt: bool, shift: bool, win: bool, vk: u32 }
 
 Serialized with a human-readable key name rather than a bare virtual-key code.
 
-**Recording workflow:**
+**Binding workflow — the user *picks*, they do not record.**
 
-1. User clicks **Record**. The field goes live and the hook enters capture mode.
-2. Modifiers and the first non-modifier key are captured; the combo renders live
-   as the user holds it (e.g. `Ctrl + Alt + M`).
-3. Releasing commits the binding.
-4. `Esc` cancels and restores the previous binding.
-5. A **Clear** control removes the binding entirely (`hotkey: null`, no hotkey active).
+1. Four modifier chips (`Ctrl` / `Alt` / `Shift` / `Win`) and one grouped key
+   dropdown. Any change writes immediately; there is no Save control.
+2. The dropdown's first entry is `None`, which clears the binding
+   (`hotkey: null`, no hotkey active).
+3. A `HOTKEY STATUS` line reports one of four states — see below.
+
+> **Superseded 2026-08-11 (Task 17).** This was originally a **Record** button
+> that captured the next keypress. It was replaced because capture required
+> mugon to observe a keystroke while its own window held focus, and that never
+> worked in real use; three rounds of diagnosis reached no root cause. Picking
+> observes no keystrokes at all, so it does not depend on the behaviour that
+> failed. The fault itself is **unexplained, not fixed** —
+> `.superpowers/sdd/2026-08-10-mugon/HANDOFF-task16.md` §6f is the evidence.
+>
+> Note the mechanism did **not** change: still `WH_KEYBOARD_LL` for firing.
+> Utilities that offer a dropdown *and* force a two-key combo are typically
+> using `RegisterHotKey`, which is the thing paragraph one rejects.
+
+**Confirmation.** Recording had one virtue a dropdown lacks: pressing the key
+proved it reached mugon. That matters most for `F13`–`F24`, which are not
+physical keys on a standard board and arrive via a remapper that may simply not
+be running. So a binding is not trusted until it has been *seen*:
+
+| Status | Condition | Line |
+|---|---|---|
+| Inactive | the hook failed to install | `HOTKEY STATUS: Inactive — keyboard hook blocked` |
+| Not set | no binding | `HOTKEY STATUS: Not set` |
+| Bound | set, never observed | `HOTKEY STATUS: Bound — press {combo} to confirm` |
+| Confirmed | observed firing at least once | `HOTKEY STATUS: Confirmed` |
+
+`Inactive` outranks the rest: with no hook, no binding can ever be confirmed,
+so prompting for a press would be an instruction that cannot succeed. The state
+persists (`config.hotkey_confirmed`) and resets whenever the binding changes.
+Confirmation hangs off **key-down** — matching is exact-modifier-set, and users
+routinely release `Ctrl` before the key, so the key-up event often carries no
+modifiers and matches nothing.
 
 **Rules:**
 
@@ -216,17 +244,25 @@ Serialized with a human-readable key name rather than a bare virtual-key code.
 - The bound combo is **shared, not exclusive**: mugon fires on it, and the
   keystroke still reaches whatever application has focus. mugon never
   consumes the event to keep it from other applications.
-- If the user binds a bare printable key, the recorder shows a non-blocking
+- If the user binds a bare printable key, the picker shows a non-blocking
   warning: in Push-to-Talk, holding it now repeats that character into
   whatever is focused — hold `V` to talk and you type `vvvvvvv`. It does not
-  prevent the binding.
-- `Esc` alone cannot be bound (reserved for cancel). `Ctrl+Alt+Del` cannot be
-  intercepted by any userspace process and is silently unbindable.
+  prevent the binding. Printable covers letters, digits **and punctuation**.
+- `Esc` cannot be bound — it is the universal way out, and is absent from the
+  offered list. `Ctrl+Alt+Del` cannot be intercepted by any userspace process
+  and is silently unbindable.
+- A modifier can never be the *bound key*, or the binding would fire on every
+  shortcut the user pressed all day. Enforced at both entrances to that field:
+  `Core::set_hotkey` for the picker, `Hotkey`'s `Deserialize` for the config
+  file.
 
 #### Key coverage — explicit requirements
 
-The recorder must accept **any** virtual-key code the hook delivers, not a curated
-subset. Specifically required:
+The offered list must cover **every** virtual-key code the hook can usefully
+deliver, not a curated subset. It is generated from `hotkey::keys::NAMED` plus
+the arithmetic letter/digit ranges — **the list the user is offered and the list
+`set_hotkey` accepts are the same object.** Two lists is how `:` came to be
+displayable nowhere and bindable never. Specifically required:
 
 | Group | Range | Notes |
 |---|---|---|
@@ -237,6 +273,7 @@ subset. Specifically required:
 | Lock keys | `CapsLock`, `ScrollLock`, `NumLock` | Bindable. Pressing them toggles the lock, same as any other bound key toggling anything else it's normally bound to. |
 | Navigation / editing | Arrows, `Home`/`End`/`PgUp`/`PgDn`, `Ins`/`Del` | — |
 | Media & browser keys | `VK_MEDIA_*`, `VK_BROWSER_*`, `VK_VOLUME_*` | Delivered by the keyboard hook |
+| Punctuation | `VK_OEM_1`–`VK_OEM_7`, `VK_OEM_PLUS/COMMA/MINUS/PERIOD` | Named for the unshifted US keycap character. Triggers the bare-printable warning. Added in Task 17 — their absence made `:` permanently unbindable. |
 
 **Two implementation constraints, both non-obvious and both load-bearing:**
 
@@ -368,7 +405,7 @@ Derived from the reference screenshot, with the purple palette replaced.
 - **Text:** off-white primary, muted grey secondary
 - **Accent:** a single highlight colour for live/active states, used sparingly
 - **Layout:** hero microphone → device dropdown → level meter → volume slider →
-  mute toggle → mode dropdown → notification toggles → hotkey recorder → settings
+  mute toggle → mode dropdown → notification toggles → hotkey picker → settings
   cog link at the bottom
 
 **Hero animation:** an SVG microphone with a looping pulse. Live state shows a slow
@@ -391,6 +428,7 @@ view.
   "device_id": null,
   "mode": "MuteToggle",
   "hotkey": { "ctrl": true, "alt": true, "shift": false, "win": false, "key": "M" },
+  "hotkey_confirmed": false,
   "notifications": { "toast": true, "sound": false },
   "autostart": false
 }
@@ -400,6 +438,13 @@ view.
 so a future schema change can migrate rather than reset. Writes are atomic
 (temp file + rename). A corrupt or unreadable config is backed up to
 `config.json.bak` and replaced with defaults rather than crashing.
+
+`hotkey_confirmed` (Task 17) records whether the hook has ever observed the bound
+combo fire — see §4.4. It is `#[serde(default)]`, so **a config written before it
+existed still loads**: it arrives `false`, which is honest, rather than tripping
+the corrupt-file path and silently resetting the user's binding and device
+choice. That fallback is the right behaviour for corruption and the wrong one for
+an older schema, and the two are easy to confuse.
 
 ---
 
@@ -424,6 +469,28 @@ Stated up front, not treated as bugs:
 1. The keyboard hook does not fire while an **elevated window** holds focus,
    unless mugon itself runs elevated. This is a Windows security boundary and
    cannot be worked around from userspace.
+1. **The hotkey does not fire while mugon's own window has focus.** Click any
+   other window, or close mugon to the tray, and it works normally. The picker
+   surfaces this as a hint under `HOTKEY STATUS`.
+
+   **Root cause unknown.** Four rounds of instrumented diagnosis (Task 16) never
+   explained it: nothing in mugon reads focus, the hook is global, and the
+   evidence is in `.superpowers/sdd/2026-08-10-mugon/HANDOFF-task16.md` §6f. It
+   was confirmed by the owner against a portable build on 2026-08-11 — the
+   earlier note in §6f that a *bound* hotkey fires normally with mugon focused
+   was based on a recollection he has since withdrawn.
+
+   Accepted rather than fixed because it is deliberately unpursued, not because
+   it is understood. The conventional fix is the second half of a standard
+   pattern — global capture while unfocused, **local key events while focused** —
+   which here means a WebView2 `keydown`/`keyup` path forwarding to the backend,
+   with Chromium key identifiers mapped back to Windows VKs. That is a real
+   piece of work, worst exactly at `F13`–`F24`, and Push-to-Talk needs the
+   key-up edge too. Deferred, not dismissed.
+
+   `RegisterHotKey` is **not** the answer here, for the reasons in §4.4's
+   opening paragraph: key-down only, so no Push-to-Talk, and exclusive, so it
+   would break the shared-not-consumed ruling.
 2. Low-level keyboard hooks use the same API as keyloggers. Some antivirus
    heuristics may flag the binary. Code signing would reduce this; it is out of
    scope for v1.
@@ -450,8 +517,15 @@ Stated up front, not treated as bugs:
 
 - Mute reflected in Windows Sound settings and in a live call
 - Hotkey fires with the target app focused, and the keystroke still reaches it
-- **`F13`–`F24` record, display and fire correctly** — tested from both a
-  software remapper (injected input) and firmware remapping if available
+- **`F13`–`F24` bind, display and fire correctly** — tested from both a
+  software remapper (injected input) and firmware remapping if available.
+  `HOTKEY STATUS` reaching `Confirmed` *is* the fire test.
+- **The settings cog is reachable at 100%, 125% and 150% display scaling**, with
+  the §4 worst case showing (bare printable key bound, error banner, long device
+  name). `inner_size` is in *logical* pixels, so scaling multiplies the window
+  height against a screen that does not grow: `tray::window_height` clamps to the
+  monitor and `body { overflow-y: auto }` catches the remainder, and neither is
+  exercised by any automated test.
 - PTT holds and releases correctly under sustained hold
 - Stuck-key watchdog recovers after a UAC prompt and after `Win+L`
 - Device unplug/replug mid-session

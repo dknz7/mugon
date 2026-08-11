@@ -3,14 +3,18 @@ import {
   api,
   onStateChanged,
   onLevel,
-  onRecording,
   onDevicesChanged,
   type AppState,
   type DeviceInfo,
   type Mode,
 } from "./api";
 import { renderMeter } from "./components/meter";
-import { initRecorder, renderRecorder } from "./components/hotkey-recorder";
+import {
+  initPicker,
+  renderKeyOptions,
+  renderPicker,
+  type PickerElements,
+} from "./components/hotkey-picker";
 
 /**
  * Task 13 built the shell; this file wires it to the backend (amendment §1).
@@ -20,10 +24,12 @@ import { initRecorder, renderRecorder } from "./components/hotkey-recorder";
  * exceptions, both transient UI state:
  *  - the settings sheet's open/closed flag, unchanged from Task 13, pure
  *    presentation, no IPC;
- *  - `recordingCombo` / `devices`, neither of which lives in `AppState` in
- *    the first place — the live combo only exists while `recording` is
- *    true, and the device list is its own command (§1/§5), not part of the
- *    hot snapshot.
+ *  - `devices`, which does not live in `AppState` in the first place — the
+ *    device list is its own command (§1/§5), not part of the hot snapshot.
+ *
+ * Task 17 replaced the hotkey recorder with a picker. The bindable key list is
+ * the same shape of exception: its own command, fetched once on window open,
+ * because it never changes for the life of the process.
  */
 
 const hero = document.querySelector<HTMLElement>("#hero");
@@ -72,22 +78,26 @@ const els = {
   volume: $<HTMLInputElement>("volume"),
   muteSwitch: $<HTMLInputElement>("mute-switch"),
   mode: $<HTMLSelectElement>("mode"),
-  hotkeyDisplay: $("hotkey-display"),
-  hotkeyRecord: $<HTMLButtonElement>("hotkey-record"),
-  hotkeyClear: $<HTMLButtonElement>("hotkey-clear"),
-  hotkeyWarning: $("hotkey-warning"),
   toast: $<HTMLInputElement>("toast-switch"),
   sound: $<HTMLInputElement>("sound-switch"),
   autostart: $<HTMLInputElement>("autostart-switch"),
 };
 
+const picker: PickerElements = {
+  ctrl: $<HTMLInputElement>("mod-ctrl"),
+  alt: $<HTMLInputElement>("mod-alt"),
+  shift: $<HTMLInputElement>("mod-shift"),
+  win: $<HTMLInputElement>("mod-win"),
+  key: $<HTMLSelectElement>("hotkey-key"),
+  clear: $<HTMLButtonElement>("hotkey-clear"),
+  status: $("hotkey-status"),
+  hint: $("hotkey-hint"),
+  warning: $("hotkey-warning"),
+};
+
 /** Last `list_devices` result. Refreshed by its own call site (window open,
  *  after `set_device`), not by `state-changed` — see `refreshDevices`. */
 let devices: DeviceInfo[] = [];
-
-/** The combo shown live while `recording` is true. Discarded once the
- *  recording commits or cancels; `AppState.hotkey_display` takes back over. */
-let recordingCombo: string | null = null;
 
 /** Device names and ids are attacker-adjacent data in the mundane sense:
  *  Windows lets anyone rename a capture device to anything at all in Sound
@@ -131,15 +141,6 @@ function refreshDevices(selected: string | null) {
 }
 
 function render(s: AppState) {
-  // The live combo belongs to *this* recording session and nothing else.
-  // Without this the previous session's combo survives, so re-entering
-  // recording shows the last key the user pressed instead of "Press a key…",
-  // which reads as a hotkey that is already bound and does nothing. Cleared
-  // here rather than on the Record click because a recording can also end via
-  // Escape, the Cancel button, or a commit — `recording` going false is the
-  // one condition common to all of them.
-  if (!s.recording) recordingCombo = null;
-
   setHeroMuted(els.hero, s.muted);
 
   renderDeviceOptions(s.selected_device);
@@ -151,10 +152,10 @@ function render(s: AppState) {
   els.muteSwitch.checked = s.muted;
   els.muteSwitch.disabled = !s.manual_controls_enabled;
 
-  renderRecorder(els.hotkeyDisplay, els.hotkeyRecord, els.hotkeyWarning, {
-    recording: s.recording,
-    combo: s.recording ? recordingCombo : s.hotkey_display,
-    bare: s.hotkey_is_bare_printable && !s.recording,
+  renderPicker(picker, {
+    hotkey: s.hotkey,
+    status: s.hotkey_status,
+    bare: s.hotkey_is_bare_printable,
   });
 
   // `hook_error` wins over `last_error`: a device error is "the last thing
@@ -192,7 +193,7 @@ els.toast.addEventListener("change", prefs);
 els.sound.addEventListener("change", prefs);
 els.autostart.addEventListener("change", () => api.setAutostart(els.autostart.checked));
 
-initRecorder(els.hotkeyDisplay, els.hotkeyRecord, els.hotkeyClear);
+initPicker(picker);
 
 onStateChanged(render);
 // 30Hz. Touches only the meter bar and its readout — never re-renders the
@@ -205,16 +206,22 @@ onLevel((db) => renderMeter(els.meter, els.meterValue, db));
 // for a saved-but-absent device, so reading it back preserves the user's
 // choice instead of snapping the dropdown to "System default".
 onDevicesChanged(() => refreshDevices(els.device.value || null));
-onRecording((_active, combo) => {
-  recordingCombo = combo;
-  renderRecorder(els.hotkeyDisplay, els.hotkeyRecord, els.hotkeyWarning, {
-    recording: true,
-    combo,
-    bare: false,
-  });
-});
 
-api.getState().then((s) => {
-  render(s);
-  refreshDevices(s.selected_device);
-});
+// The key list must be in the DOM before the first `render`, or `renderPicker`
+// finds no matching <option> for a saved binding and treats it as unavailable.
+//
+// The `catch` keeps that ordering from also coupling the two *failures*: without
+// it, a rejected `list_bindable_keys` would leave the whole window on its
+// hardcoded placeholders — no device list, no mode, no mute state, no error
+// banner — with the status line still reading "Not set", which by then is a lie.
+// A failure here should cost the dropdown and nothing else.
+api
+  .listBindableKeys()
+  .catch(() => [])
+  .then((groups) => {
+    renderKeyOptions(picker.key, groups);
+    return api.getState().then((s) => {
+      render(s);
+      refreshDevices(s.selected_device);
+    });
+  });

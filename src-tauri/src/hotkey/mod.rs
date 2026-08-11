@@ -2,7 +2,6 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 pub mod keys;
 pub mod hook;
-pub mod recorder;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Hotkey {
@@ -30,13 +29,17 @@ impl Hotkey {
     /// The hotkey is shared, not exclusive (§4.4), so that character still
     /// reaches whatever is focused — but in Push-to-Talk, holding it also
     /// repeats the character for as long as the key is down. Drives the
-    /// recorder's warning. F13-F24 are deliberately excluded — they are the
+    /// picker's warning. F13-F24 are deliberately excluded — they are the
     /// recommended bare binding.
+    ///
+    /// Which VKs count lives in [`keys::is_printable`], next to the table that
+    /// decides what is bindable in the first place — the two have to agree, and
+    /// a duplicated range check here is how they would stop agreeing.
     pub fn is_bare_printable(&self) -> bool {
         if self.ctrl || self.alt || self.shift || self.win {
             return false;
         }
-        (0x41..=0x5A).contains(&self.vk) || (0x30..=0x39).contains(&self.vk)
+        keys::is_printable(self.vk)
     }
 }
 
@@ -73,8 +76,8 @@ impl<'de> Deserialize<'de> for Hotkey {
         // modifier-named binding would fire that action on every bare press
         // of Ctrl/Alt/Shift/Win system-wide, since those keys are held
         // constantly for other shortcuts. This is the config-file half of
-        // that invariant — `Recorder::feed` (recorder.rs) is the other half,
-        // rejecting modifiers as they're pressed during recording. Corrupt
+        // that invariant — `Core::set_hotkey` (state.rs) is the other half,
+        // rejecting a modifier chosen in the picker. Corrupt
         // or hand-edited config containing a modifier key name must fail to
         // deserialize so `Config::load` falls back to defaults instead of
         // ever handing the hook a modifier binding.
@@ -129,6 +132,17 @@ mod tests {
         // handles the failure safely.
         let json = r#"{"ctrl":false,"alt":false,"shift":false,"win":false,"key":"LeftCtrl"}"#;
         assert!(serde_json::from_str::<Hotkey>(json).is_err());
+    }
+
+    /// Task 17. Punctuation became bindable, and bare `;` has exactly the
+    /// problem bare `M` has: it types the character into whatever is focused
+    /// while also driving the microphone. The warning must follow.
+    #[test]
+    fn is_bare_printable_flags_punctuation() {
+        let semi = Hotkey { ctrl: false, alt: false, shift: false, win: false, vk: 0xBA };
+        assert!(semi.is_bare_printable(), "bare ; should warn");
+        let ctrl_semi = Hotkey { ctrl: true, alt: false, shift: false, win: false, vk: 0xBA };
+        assert!(!ctrl_semi.is_bare_printable(), "Ctrl+; is not bare");
     }
 
     #[test]
