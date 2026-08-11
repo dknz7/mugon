@@ -1,6 +1,6 @@
 [package]
 name = "mugon"
-version = "0.1.0"
+version = "0.1.1"
 description = "Tray microphone mute and push-to-talk for Windows"
 authors = ["Byron Dickens"]
 edition = "2021"

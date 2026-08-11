@@ -19,7 +19,7 @@ toast and beep feedback, and run-at-login.
 
 ## Install
 
-Download `mugon_0.1.0_x64-setup.exe` from
+Download `mugon_0.1.1_x64-setup.exe` from
 [Releases](https://github.com/dknz7/mugon/releases) and run it. It is a per-user
 install — no elevation, nothing written outside your profile.
 
@@ -32,8 +32,8 @@ Uninstall from Settings → Apps, or run `%LOCALAPPDATA%\mugon\uninstall.exe`.
 
 ## Using it
 
-Left-click the tray icon for the settings window. Right-click it for Toggle
-Mute, the mode switch, Settings, and Quit. **Quit is only on the tray menu** —
+Left-click the tray icon to open mugon. Right-click it for Open mugon, Toggle
+Mute, the mode switch, and Quit. **Quit is only on the tray menu** —
 closing the settings window destroys it and leaves mugon running in the tray,
 which is what keeps the idle footprint small and Windows' microphone-in-use
 indicator dark.
@@ -141,7 +141,7 @@ npx tauri build
 ```
 
 The NSIS installer lands in `src-tauri/target/release/bundle/nsis/`, at roughly
-1.12 MiB for 0.1.0.
+1.12 MiB for 0.1.1.
 
 For a debug run, `npx tauri dev`. Tests:
 

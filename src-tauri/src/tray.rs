@@ -60,15 +60,23 @@ pub fn build(app: &AppHandle) -> tauri::Result<()> {
     let mode_ptt =
         CheckMenuItem::with_id(app, "mode_ptt", "Push to Talk", true, false, None::<&str>)?;
     let modes = Submenu::with_id_and_items(app, "modes", "Mode", true, &[&mode_toggle, &mode_ptt])?;
-    let settings = MenuItem::with_id(app, "settings", "Settings", true, None::<&str>)?;
+    // "Open mugon", not "Settings". It calls the same `show_window` a left-click
+    // on the icon does, which opens the main window — the settings *panel* is
+    // the cog flyout inside it, one click further. Labelling this "Settings"
+    // promised the panel and delivered the window.
+    //
+    // First in the menu because it is the item most likely to be wanted, and
+    // because it doubles as the fallback if the left-click handler ever misses:
+    // `show_menu_on_left_click(false)` means that path is the only other way in.
+    let open = MenuItem::with_id(app, "open", "Open mugon", true, None::<&str>)?;
     let quit = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
     let menu = Menu::with_items(
         app,
         &[
+            &open,
+            &PredefinedMenuItem::separator(app)?,
             &toggle,
             &modes,
-            &PredefinedMenuItem::separator(app)?,
-            &settings,
             &PredefinedMenuItem::separator(app)?,
             &quit,
         ],
@@ -104,7 +112,7 @@ pub fn build(app: &AppHandle) -> tauri::Result<()> {
             }
             "mode_toggle" => set_mode(app, Mode::MuteToggle),
             "mode_ptt" => set_mode(app, Mode::PushToTalk),
-            "settings" => show_window(app),
+            "open" => show_window(app),
             "quit" => {
                 // §4.2: the mic MUST be restored before we go, and it has to
                 // happen here rather than on the way out, while the audio

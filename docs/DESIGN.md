@@ -359,8 +359,14 @@ Toast and beep are independently toggleable.
 - **Icon** reflects live state: microphone (live) vs. struck-through microphone
   (muted). 16px and 32px ICO variants embedded.
 - **Left click** → show/create the settings window.
-- **Right click menu:** current state (disabled label) · Toggle Mute · Mode ▸
-  (Mute Toggle / Push to Talk) · Settings · Quit.
+- **Right click menu:** Open mugon · Toggle Mute · Mode ▸ (Mute Toggle /
+  Push to Talk) · Quit.
+
+  *Open mugon* is first because it is the item most often wanted, and it is the
+  only fallback for reaching the window if the left-click handler misses —
+  `show_menu_on_left_click(false)` means there is no other path in. It was
+  originally labelled *Settings*, which promised the settings panel and
+  delivered the main window; the panel is the cog flyout one click inside it.
 
 ### 4.10 Window lifecycle
 
