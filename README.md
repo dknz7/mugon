@@ -19,7 +19,8 @@ toast and beep feedback, and run-at-login.
 
 ## Install
 
-Download `mugon_0.1.0_x64-setup.exe` (1.12 MiB) and run it. It is a per-user
+Download `mugon_0.1.0_x64-setup.exe` from
+[Releases](https://github.com/dknz7/mugon/releases) and run it. It is a per-user
 install — no elevation, nothing written outside your profile.
 
 - Application: `%LOCALAPPDATA%\mugon\`
@@ -154,4 +155,4 @@ only be tested against an installed one.
 
 ## Licence
 
-Unlicensed personal project.
+MIT — see [LICENSE](LICENSE).
